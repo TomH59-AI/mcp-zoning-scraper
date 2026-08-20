@@ -14,6 +14,7 @@ import {
   type RunOptions,
   type RunSummary
 } from "../tools/runScraper.js";
+import { loadQueue, saveQueue, resetQueue, planNextBatch } from "../tools/queue.js";
 
 dotenv.config({ path: path.resolve(process.cwd(), ".env") });
 
@@ -30,11 +31,12 @@ interface Job {
   recent: JurisdictionResult[];
   summary?: RunSummary;
   error?: string;
+  queue?: { state: string; offset: number; stateIndex: number };
 }
 const jobs = new Map<string, Job>();
 let activeJob: Job | null = null;
 
-function startJob(options: RunOptions): Job {
+function startJob(options: RunOptions, queue?: { state: string; offset: number; stateIndex: number }): Job {
   const job: Job = {
     id: randomUUID().slice(0, 8),
     status: "running",
@@ -42,7 +44,8 @@ function startJob(options: RunOptions): Job {
     options,
     done: 0,
     total: 0,
-    recent: []
+    recent: [],
+    queue
   };
   jobs.set(job.id, job);
   activeJob = job;
@@ -59,6 +62,9 @@ function startJob(options: RunOptions): Job {
       job.status = "done";
       job.summary = { ...summary, results: summary.results.slice(-25) };
       job.finished_at = new Date().toISOString();
+      // Only a batch that actually ran moves the cursor — a failed job must be
+      // retried at the same offset, not skipped past.
+      advanceQueueAfter(job, summary);
     })
     .catch((err: unknown) => {
       job.status = "failed";
@@ -70,6 +76,30 @@ function startJob(options: RunOptions): Job {
     });
 
   return job;
+}
+
+// Advance the shared cursor when a queue-driven batch finishes, so the next
+// scheduled firing picks up where this one stopped rather than repeating it.
+function advanceQueueAfter(job: Job, summary: RunSummary): void {
+  if (!job.queue) return;
+  const q = loadQueue();
+  q.offset = job.queue.offset + (summary.processed || 0);
+  q.stateIndex = job.queue.stateIndex;
+  q.batches_run += 1;
+  q.jurisdictions_done += summary.processed || 0;
+  q.ingested_ok += summary.ingested_ok || 0;
+  q.ingested_failed += summary.ingested_failed || 0;
+  q.last_batch = {
+    job_id: job.id,
+    state: job.queue.state,
+    offset: job.queue.offset,
+    processed: summary.processed,
+    ingested_ok: summary.ingested_ok,
+    ingested_failed: summary.ingested_failed,
+    finished_at: new Date().toISOString()
+  };
+  saveQueue(q);
+  console.log(`[queue] ${job.queue.state} offset ${job.queue.offset} -> ${q.offset} (batch ${q.batches_run}, ${q.jurisdictions_done} jurisdictions done)`);
 }
 
 function jobView(job: Job) {
@@ -167,6 +197,97 @@ function createServer(): McpServer {
         }
         const summary = await runScraper({ ...options, limit: Math.min(options.limit ?? 1, 3) });
         return text({ ok: true, ...summary });
+      } catch (err) {
+        return fail(err);
+      }
+    }
+  );
+
+  server.registerTool(
+    "startZoningSweep",
+    {
+      description:
+        "Begin (or restart) a multi-state sweep of the Notion zoning library. Sets the durable cursor; does not scrape anything by itself — call runNextBatch to do the work. Use this once, then let a scheduled task call runNextBatch repeatedly.",
+      inputSchema: {
+        states: z.array(z.string()).min(1).describe("States in the order to sweep, e.g. ['FL','NC','GA']")
+      }
+    },
+    async ({ states }) => {
+      try {
+        const q = resetQueue(states);
+        const { plan } = await planNextBatch(q, 1);
+        return text({ ok: true, queue: q, up_next: plan });
+      } catch (err) {
+        return fail(err);
+      }
+    }
+  );
+
+  server.registerTool(
+    "runNextBatch",
+    {
+      description:
+        "Scrape the next N jurisdictions in the sweep and push them to SiteHawk (Base44), then advance the durable cursor. Safe to call on a schedule: it returns immediately with a job_id, refuses to double-run while a job is in flight, and resumes at the right place after a redeploy. Returns done:true when every state in the sweep is finished.",
+      inputSchema: {
+        batch: z.number().int().min(1).max(25).optional().describe("Jurisdictions this batch (default 3)"),
+        dryRun: z.boolean().optional().describe("Scrape without writing to Base44")
+      }
+    },
+    async ({ batch, dryRun }) => {
+      try {
+        if (activeJob) {
+          return text({
+            ok: true,
+            skipped: "job_in_flight",
+            message: `Batch ${activeJob.id} is still running (${activeJob.done}/${activeJob.total}) — nothing started.`,
+            job_id: activeJob.id
+          });
+        }
+        const size = batch ?? 3;
+        const q = loadQueue();
+        if (!q.states.length) {
+          return text({ ok: false, error: "No sweep configured — call startZoningSweep with the states first." });
+        }
+        const { plan, state: advanced } = await planNextBatch(q, size);
+        if (plan.done) {
+          if (!advanced.finished_at) {
+            advanced.finished_at = new Date().toISOString();
+            saveQueue(advanced);
+          }
+          return text({ ok: true, done: true, queue: advanced, message: "Sweep complete — every state has been scraped." });
+        }
+        // planNextBatch may have stepped over an exhausted state; persist that
+        // before the job starts so a crash cannot rewind it.
+        saveQueue(advanced);
+        const job = startJob(
+          { state: plan.state, limit: plan.size, offset: plan.offset, dryRun },
+          { state: plan.state!, offset: plan.offset!, stateIndex: advanced.stateIndex }
+        );
+        return text({ ok: true, started: true, batch: plan, ...jobView(job) });
+      } catch (err) {
+        return fail(err);
+      }
+    }
+  );
+
+  server.registerTool(
+    "getSweepStatus",
+    {
+      description: "Where the multi-state sweep has got to: current state, cursor, totals ingested, and what the next batch would be.",
+      inputSchema: {}
+    },
+    async () => {
+      try {
+        const q = loadQueue();
+        if (!q.states.length) return text({ ok: true, configured: false, message: "No sweep configured." });
+        const { plan } = await planNextBatch(q, 3);
+        return text({
+          ok: true,
+          configured: true,
+          queue: q,
+          up_next: plan,
+          active_job: activeJob ? { job_id: activeJob.id, progress: `${activeJob.done}/${activeJob.total}` } : null
+        });
       } catch (err) {
         return fail(err);
       }
