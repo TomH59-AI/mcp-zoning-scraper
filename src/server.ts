@@ -65,7 +65,13 @@ function isAuthorized(request: Request, token: string): boolean {
 }
 
 function startHttpServer(port: number, authToken: string): void {
-  const app = createMcpExpressApp();
+  const railwayPublicDomain =
+    process.env.RAILWAY_PUBLIC_DOMAIN?.trim() ||
+    "mcp-zoning-scraper-production.up.railway.app";
+  const app = createMcpExpressApp({
+    host: "0.0.0.0",
+    allowedHosts: ["127.0.0.1", "localhost", railwayPublicDomain]
+  });
 
   app.get("/health", (_request: Request, response: Response) => {
     response.status(200).json({ ok: true, service: "mcp-zoning-scraper" });
