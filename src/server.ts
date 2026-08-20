@@ -4,6 +4,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import dotenv from "dotenv";
 import type { Request, Response } from "express";
+import { timingSafeEqual } from "node:crypto";
 import path from "node:path";
 import { runScraper } from "../tools/runScraper.js";
 
@@ -51,7 +52,19 @@ async function startStdioServer(): Promise<void> {
   console.error("MCP Zoning Scraper running on stdio");
 }
 
-function startHttpServer(port: number): void {
+function isAuthorized(request: Request, token: string): boolean {
+  const provided = request.get("authorization") ?? "";
+  const expected = `Bearer ${token}`;
+  const providedBytes = Buffer.from(provided);
+  const expectedBytes = Buffer.from(expected);
+
+  return (
+    providedBytes.length === expectedBytes.length &&
+    timingSafeEqual(providedBytes, expectedBytes)
+  );
+}
+
+function startHttpServer(port: number, authToken: string): void {
   const app = createMcpExpressApp();
 
   app.get("/health", (_request: Request, response: Response) => {
@@ -59,6 +72,15 @@ function startHttpServer(port: number): void {
   });
 
   app.post("/mcp", async (request: Request, response: Response) => {
+    if (!isAuthorized(request, authToken)) {
+      response.status(401).json({
+        jsonrpc: "2.0",
+        error: { code: -32001, message: "Unauthorized" },
+        id: null
+      });
+      return;
+    }
+
     const server = createServer();
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined
@@ -112,7 +134,11 @@ async function main(): Promise<void> {
     if (!Number.isInteger(port) || port <= 0) {
       throw new Error(`Invalid PORT value: ${railwayPort}`);
     }
-    startHttpServer(port);
+    const authToken = process.env.MCP_AUTH_TOKEN?.trim();
+    if (!authToken) {
+      throw new Error("Missing required environment variable: MCP_AUTH_TOKEN");
+    }
+    startHttpServer(port, authToken);
     return;
   }
 
