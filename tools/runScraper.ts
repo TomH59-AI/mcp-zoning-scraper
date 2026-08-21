@@ -207,8 +207,11 @@ export async function getZoningSources(): Promise<ZoningSource[]> {
       const fullPage = page as { id: string; properties: Record<string, unknown> };
       const props = fullPage.properties;
       const jurisdiction = plain(props.Jurisdiction);
-      const stateRaw = plain(props.State);
-      const urlRaw = plain(props.URL);
+      // The current registry has the state column under an empty display name,
+      // while some Notion surfaces expose custom columns by their stable ID.
+      // Keep the named properties first and accept both existing representations.
+      const stateRaw = plain(props.State) ?? plain(props[""]);
+      const urlRaw = plain(props.URL) ?? plain(props["userDefined:URL"]);
       const authority_level = plain(props["Authority Level"]);
       if (!jurisdiction || !stateRaw || !urlRaw || !/^https?:\/\//i.test(urlRaw)) continue;
       sources.push({
