@@ -13,7 +13,6 @@
 //   BASE44_WEBHOOK_SECRET  the app's WEBHOOK_SECRET  (falls back to BASE44_API_KEY)
 //   SCRAPFLY_API_KEY / SCRAPFLY_KEY, OXYLABS_USERNAME, OXYLABS_PASSWORD / OXYLABS_KEY
 import axios from "axios";
-import { Client, isFullPage } from "@notionhq/client";
 
 // ---------- types ----------
 export interface ZoningSource {
@@ -87,6 +86,49 @@ function optionalEnv(...names: string[]): string | null {
 }
 
 // ---------- Notion reading ----------
+const NOTION_API_VERSION = "2026-03-11";
+
+type NotionPageList = {
+  results: unknown[];
+  has_more: boolean;
+  next_cursor?: string | null;
+};
+
+async function notionApi<T>(apiKey: string, pathname: string, init: RequestInit = {}): Promise<T> {
+  const response = await fetch(`https://api.notion.com/v1${pathname}`, {
+    ...init,
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Notion-Version": NOTION_API_VERSION,
+      "Content-Type": "application/json",
+      ...init.headers,
+    },
+  });
+  const body = await response.json().catch(() => null) as Record<string, unknown> | null;
+  if (!response.ok) {
+    const message = typeof body?.message === "string" ? body.message : response.statusText;
+    throw new Error(`Notion API ${response.status}: ${message}`);
+  }
+  return body as T;
+}
+
+async function resolveDataSourceId(apiKey: string, databaseId: string): Promise<string> {
+  const configured = optionalEnv("NOTION_ZONING_DATA_SOURCE");
+  if (configured) return configured;
+
+  const database = await notionApi<{ data_sources?: Array<{ id?: string }> }>(
+    apiKey,
+    `/databases/${databaseId}`,
+  );
+  const dataSourceId = database.data_sources?.find((item) => item?.id)?.id;
+  if (!dataSourceId) {
+    throw new Error(
+      "Notion database has no queryable data source. Set NOTION_ZONING_DATA_SOURCE to its data source ID.",
+    );
+  }
+  return dataSourceId;
+}
+
 function plain(property: unknown): string | null {
   if (typeof property !== "object" || property === null || !("type" in property)) return null;
   const p = property as { type: string; [k: string]: unknown };
@@ -140,16 +182,30 @@ export function toStateCode(value: string): string {
 }
 
 export async function getZoningSources(): Promise<ZoningSource[]> {
-  const notion = new Client({ auth: requiredEnv("NOTION_KEY") });
+  const apiKey = requiredEnv("NOTION_KEY");
   const database_id = requiredEnv("NOTION_ZONING_DB");
+  const data_source_id = await resolveDataSourceId(apiKey, database_id);
   const sources: ZoningSource[] = [];
   let cursor: string | undefined;
 
   do {
-    const response = await notion.databases.query({ database_id, start_cursor: cursor, page_size: 100 });
+    const response = await notionApi<NotionPageList>(
+      apiKey,
+      `/data_sources/${data_source_id}/query`,
+      {
+        method: "POST",
+        body: JSON.stringify({ start_cursor: cursor, page_size: 100 }),
+      },
+    );
     for (const page of response.results) {
-      if (!isFullPage(page)) continue;
-      const props = page.properties as Record<string, unknown>;
+      if (
+        typeof page !== "object" ||
+        page === null ||
+        !("id" in page) ||
+        !("properties" in page)
+      ) continue;
+      const fullPage = page as { id: string; properties: Record<string, unknown> };
+      const props = fullPage.properties;
       const jurisdiction = plain(props.Jurisdiction);
       const stateRaw = plain(props.State);
       const urlRaw = plain(props.URL);
@@ -160,7 +216,7 @@ export async function getZoningSources(): Promise<ZoningSource[]> {
         state: toStateCode(stateRaw),
         authority_level,
         url: unwrapUrl(urlRaw),
-        notion_page_id: page.id,
+        notion_page_id: fullPage.id,
       });
     }
     cursor = response.has_more ? response.next_cursor ?? undefined : undefined;
@@ -419,3 +475,4 @@ export async function runScraper(opts: RunOptions = {}, onProgress?: (r: Jurisdi
 
   return summary;
 }
+
