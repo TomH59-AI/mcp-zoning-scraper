@@ -326,7 +326,7 @@ function looksLikePlaceholder(text: string): boolean {
 
 export async function scrapeUrl(url: string): Promise<{ text: string; method: string }> {
   const attempts: Array<[string, () => Promise<string>]> = isJsHeavyCodeSite(url)
-    ? [["oxylabs", () => scrapeWithOxyLabs(url)], ["scrapfly", () => scrapeWithScrapfly(url)]]
+    ? [["scrapfly", () => scrapeWithScrapfly(url)], ["oxylabs", () => scrapeWithOxyLabs(url)]]
     : [["scrapfly", () => scrapeWithScrapfly(url)], ["direct", () => scrapeDirect(url)], ["oxylabs", () => scrapeWithOxyLabs(url)]];
 
   const errors: string[] = [];
@@ -387,7 +387,7 @@ async function getJurisdictionPolygon(jurisdiction: string, state: string): Prom
 }
 
 // ---------- Base44 intake ----------
-async function sendToBase44(payload: unknown): Promise<{ ok: boolean; status: number; summary?: unknown; error?: string }> {
+export async function sendToBase44(payload: unknown): Promise<{ ok: boolean; status: number; summary?: unknown; error?: string }> {
   const endpoint = requiredEnv("BASE44_ZONING_INGEST");
   const secret = optionalEnv("BASE44_WEBHOOK_SECRET", "BASE44_API_KEY");
   if (!secret) throw new Error("Missing BASE44_WEBHOOK_SECRET (or BASE44_API_KEY)");

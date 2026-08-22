@@ -15,6 +15,11 @@ import {
   type RunSummary
 } from "../tools/runScraper.js";
 import { loadQueue, saveQueue, resetQueue, planNextBatch } from "../tools/queue.js";
+import {
+  enrichZoningData,
+  listEnrichmentQueue,
+  runEnrichmentQueue
+} from "../tools/enrichmentZoningData.js";
 
 dotenv.config({ path: path.resolve(process.cwd(), ".env") });
 
@@ -165,6 +170,70 @@ function createServer(): McpServer {
     async (args) => {
       try {
         return text(await listZoningSources(args));
+      } catch (err) {
+        return fail(err);
+      }
+    }
+  );
+
+  server.registerTool(
+    "Enrichment-Zoning-Data-Tool",
+    {
+      description:
+        "Scrape one jurisdiction's official zoning, tower, planning, building, fee, and GIS URLs with Scrapfly first and Oxylabs as fallback. Extract the complete SiteHawk five-section zoning/permitting profile, upsert the canonical Base44 registry used by coordinate search, and create or refresh the enriched page under Zoning-Enrichment-Folder's correct state page.",
+      inputSchema: {
+        jurisdiction: z.string().min(1).describe("County, city, township, village, or other zoning jurisdiction name"),
+        state: z.string().min(2).describe("Two-letter state code or full state name"),
+        urls: z.array(z.union([
+          z.string().url(),
+          z.object({
+            url: z.string().url(),
+            authority_level: z.string().optional().describe("zoning_ordinance, tower_rules, planning, building, fee_schedule, gis, or other")
+          })
+        ])).min(1).max(20),
+        writeToNotion: z.boolean().optional().describe("Write the formatted enriched page to Notion (default true)"),
+        replaceExisting: z.boolean().optional().describe("Refresh an existing exact-match enriched page instead of making a duplicate (default true)")
+      }
+    },
+    async (args) => {
+      try {
+        return text(await enrichZoningData(args));
+      } catch (err) {
+        return fail(err);
+      }
+    }
+  );
+
+  server.registerTool(
+    "previewEnrichmentQueue",
+    {
+      description:
+        "Preview Pending or Failed URL rows in the Ordinances Inbox database inside Zoning-Enrichment-Folder. Rows require Jurisdiction Name, State, Ordinance URL, and optionally Authority Level.",
+      inputSchema: { limit: z.number().int().min(1).max(100).optional() }
+    },
+    async ({ limit }) => {
+      try {
+        const rows = await listEnrichmentQueue(limit ?? 25);
+        return text({ ok: true, rows: rows.length, queue: rows });
+      } catch (err) {
+        return fail(err);
+      }
+    }
+  );
+
+  server.registerTool(
+    "runEnrichmentQueue",
+    {
+      description:
+        "Process Pending URL rows from the Ordinances Inbox database, grouping multiple URLs for the same jurisdiction. Each result is written to Base44 and to the correct state page in Zoning-Enrichment-Folder, then the queue row is updated with status, provenance, field count, and destination link.",
+      inputSchema: {
+        limit: z.number().int().min(1).max(25).optional().describe("Maximum jurisdictions to process (default 5)"),
+        replaceExisting: z.boolean().optional().describe("Refresh exact-match enriched pages (default true)")
+      }
+    },
+    async ({ limit, replaceExisting }) => {
+      try {
+        return text(await runEnrichmentQueue(limit ?? 5, replaceExisting !== false));
       } catch (err) {
         return fail(err);
       }
