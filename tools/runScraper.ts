@@ -12,7 +12,7 @@
 //   BASE44_WEBHOOK_SECRET  the app's WEBHOOK_SECRET  (falls back to BASE44_API_KEY)
 //   SCRAPFLY_API_KEY / SCRAPFLY_KEY, OXYLABS_USERNAME, OXYLABS_PASSWORD / OXYLABS_KEY
 import axios from "axios";
-import pdfParse from "pdf-parse";
+import pdfParse from "pdf-parse/lib/pdf-parse.js";
 
 // ---------- types ----------
 export interface ZoningSource {
