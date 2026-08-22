@@ -158,7 +158,7 @@ const selectionShape = {
 };
 
 function createServer(): McpServer {
-  const server = new McpServer({ name: "mcp-zoning-scraper", version: "2.1.1" });
+  const server = new McpServer({ name: "mcp-zoning-scraper", version: "2.2.0" });
 
   server.registerTool(
     "listZoningSources",
@@ -408,7 +408,7 @@ function startHttpServer(port: number, authToken: string): void {
   });
 
   app.get("/health", (_request: Request, response: Response) => {
-    response.status(200).json({ ok: true, service: "mcp-zoning-scraper", version: "2.1.1", active_job: activeJob ? jobView(activeJob) : null });
+    response.status(200).json({ ok: true, service: "mcp-zoning-scraper", version: "2.2.0", active_job: activeJob ? jobView(activeJob) : null });
   });
 
   // Same bearer token as /mcp — handy for watching a long run from a browser/curl.

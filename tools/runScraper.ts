@@ -12,6 +12,7 @@
 //   BASE44_WEBHOOK_SECRET  the app's WEBHOOK_SECRET  (falls back to BASE44_API_KEY)
 //   SCRAPFLY_API_KEY / SCRAPFLY_KEY, OXYLABS_USERNAME, OXYLABS_PASSWORD / OXYLABS_KEY
 import axios from "axios";
+import pdfParse from "pdf-parse";
 
 // ---------- types ----------
 export interface ZoningSource {
@@ -340,12 +341,26 @@ async function scrapeWithOxyLabs(url: string): Promise<string> {
 async function scrapeWithScrapfly(url: string): Promise<string> {
   const key = optionalEnv("SCRAPFLY_API_KEY", "SCRAPFLY_KEY");
   if (!key) throw new Error("Scrapfly key not configured");
-  const response = await axios.get<{ result?: { content?: string } }>("https://api.scrapfly.io/scrape", {
-    params: { key, url, render_js: true, asp: true, country: "us" },
+  const response = await axios.get<{ result?: { content?: string; format?: string; content_type?: string } }>("https://api.scrapfly.io/scrape", {
+    params: { key, url, render_js: !/\.pdf(?:$|[?#])/i.test(url), asp: true, country: "us" },
     timeout: 90000,
   });
-  const content = response.data.result?.content;
+  const result = response.data.result;
+  const content = result?.content;
   if (!content) throw new Error("Scrapfly returned no content");
+  const format = String(result?.format || "").toLowerCase();
+  const isPdf = /\.pdf(?:$|[?#])/i.test(url) || /application\/pdf/i.test(String(result?.content_type || ""));
+  if (isPdf || format === "binary" || format === "blob") {
+    const bytes = format === "blob"
+      ? Buffer.from((await axios.get<ArrayBuffer>(content, { params: { key }, responseType: "arraybuffer", timeout: 90000 })).data)
+      : Buffer.from(content, "base64");
+    const parsed = await pdfParse(bytes);
+    if (!parsed.text || parsed.text.length < 400) throw new Error("Scrapfly PDF contained no extractable text");
+    return parsed.text;
+  }
+  if (format === "clob" && /^https?:\/\//i.test(content)) {
+    return String((await axios.get(content, { params: { key }, responseType: "text", timeout: 90000 })).data || "");
+  }
   return content;
 }
 
