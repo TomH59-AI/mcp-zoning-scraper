@@ -1,9 +1,8 @@
 // runScraper — reads the Notion database "The United States Zoning URL"
 // (Jurisdiction | Authority Level | URL | State), scrapes every URL for a
 // jurisdiction, and POSTs the cleaned page text to the SiteHawk Base44 intake
-// function `zoningScraperIngest`, which LLM-extracts the four SCIP sections
-// (Zoning Overview, Tower Specifics, Site Plan Overview, Building Permit
-// Information) and upserts Jurisdiction / TelecomOrdinance / JurisdictionRegistry
+// function `zoningScraperIngest`, which LLM-extracts the complete five-section
+// SCIP profile and upserts Jurisdiction / TelecomOrdinance / JurisdictionRegistry
 // / JurisdictionResource.
 //
 // Env (Railway → Variables):
@@ -280,6 +279,50 @@ export function cleanHtml(html: string): string {
 
 const MAX_TEXT_CHARS = 60000;
 
+function selectRelevantSourceText(text: string, limit = MAX_TEXT_CHARS): string {
+  if (text.length <= limit) return text;
+
+  const selected: Array<[number, number]> = [];
+  let output = "";
+  const appendRange = (start: number, end: number, label: string) => {
+    if (output.length >= limit) return;
+    const safeStart = Math.max(0, start);
+    const safeEnd = Math.min(text.length, end);
+    if (safeEnd <= safeStart) return;
+    const overlap = selected.some(([a, b]) => {
+      const shared = Math.max(0, Math.min(b, safeEnd) - Math.max(a, safeStart));
+      return shared / (safeEnd - safeStart) > 0.6;
+    });
+    if (overlap) return;
+    const marker = output ? `\n\n[${label} near source character ${safeStart}]\n` : "";
+    const remaining = limit - output.length - marker.length;
+    if (remaining <= 0) return;
+    output += marker + text.slice(safeStart, Math.min(safeEnd, safeStart + remaining));
+    selected.push([safeStart, safeEnd]);
+  };
+
+  const sample = (pattern: RegExp, count: number, before: number, after: number, label: string) => {
+    const positions = [...text.matchAll(pattern)].map((match) => match.index).filter((index): index is number => Number.isFinite(index));
+    if (!positions.length) return;
+    const sampleCount = Math.min(count, positions.length);
+    for (let index = 0; index < sampleCount; index += 1) {
+      const position = positions[Math.floor(index * (positions.length - 1) / Math.max(1, sampleCount - 1))];
+      appendRange(position - before, position + after, label);
+    }
+  };
+
+  appendRange(0, 4000, "Document opening");
+  // Highest priority: distribute broad windows across the exact tower article,
+  // even when that article is hundreds of pages into the source PDF.
+  sample(/communication tower|tower site|communication antenna/gi, 12, 1800, 2600, "Communication tower excerpt");
+  sample(/wireless|telecommunications?|antenna|collocat(?:e|ion)|small cell/gi, 6, 900, 1300, "Wireless facilities excerpt");
+  sample(/conditional use|special exception|special permit|public hearing|board of zoning appeals|board of adjustment|appeal|site plan/gi, 6, 850, 1250, "Approval process excerpt");
+  sample(/setback|fall zone|collapse zone|height|residential separation|tower separation|stealth|conceal|landscap|screen|fenc/gi, 6, 850, 1250, "Technical standards excerpt");
+  sample(/building permit|planning department|zoning department|fee|validity|extension|bond|e-?911|address/gi, 5, 750, 1100, "Permitting excerpt");
+  appendRange(text.length - 1500, text.length, "Document ending");
+  return output.slice(0, limit);
+}
+
 async function scrapeWithOxyLabs(url: string): Promise<string> {
   const username = optionalEnv("OXYLABS_USERNAME");
   const password = optionalEnv("OXYLABS_PASSWORD", "OXYLABS_KEY");
@@ -338,7 +381,7 @@ export async function scrapeUrl(url: string): Promise<{ text: string; method: st
         errors.push(`${method}: thin/placeholder page (${text.length} chars)`);
         continue;
       }
-      return { text: text.slice(0, MAX_TEXT_CHARS), method };
+      return { text: selectRelevantSourceText(text), method };
     } catch (err) {
       errors.push(`${method}: ${err instanceof Error ? err.message : String(err)}`);
     }
