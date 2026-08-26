@@ -122,6 +122,170 @@ function normalizeSources(inputs: Array<string | EnrichmentSourceInput>): Enrich
   return sources;
 }
 
+function asRecord(value: unknown): Record<string, any> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, any>
+    : null;
+}
+
+function unwrapRecord(value: unknown): Record<string, any> | null {
+  const wrapper = asRecord(value);
+  return asRecord(wrapper?.record) || wrapper;
+}
+
+function compactRecord(value: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(value).filter(([, item]) => item !== null && item !== undefined && item !== ""),
+  );
+}
+
+function yesNo(value: unknown): string | null {
+  if (value === true) return "Yes";
+  if (value === false) return "No";
+  return null;
+}
+
+function joinContact(name: unknown, email: unknown, phone: unknown): string | null {
+  const parts = [name, email, phone].map((value) => String(value || "").trim()).filter(Boolean);
+  return parts.length ? parts.join(" | ") : null;
+}
+
+function formattedDistance(value: unknown, unit: unknown): string | null {
+  if (value === null || value === undefined || value === "") return null;
+  const number = Number(value);
+  if (!Number.isFinite(number)) return null;
+  if (unit === "pct") return `${number}% of tower height`;
+  if (unit === "multiple") return `${number} × tower height`;
+  return `${number} ft`;
+}
+
+function canonicalRecordsToProfile(
+  jurisdictionRecord: Record<string, any>,
+  telecomRecord: Record<string, any> | null,
+  registryRecord: Record<string, any> | null,
+  resourceWrappers: unknown,
+  jurisdiction: string,
+  state: string,
+): Record<string, unknown> {
+  const resources = Array.isArray(resourceWrappers)
+    ? resourceWrappers.map(unwrapRecord).filter((value): value is Record<string, any> => Boolean(value))
+    : [];
+  const sourceFor = (types: string[], pattern?: RegExp) => {
+    const hit = resources.find((resource) =>
+      types.includes(String(resource.resource_type || ""))
+      || Boolean(pattern?.test(`${resource.title || ""} ${resource.url || ""}`)),
+    );
+    return hit?.url || null;
+  };
+  const tower = telecomRecord || {};
+  const fallZone = [
+    tower.fall_zone_ft !== null && tower.fall_zone_ft !== undefined ? `${tower.fall_zone_ft} ft` : null,
+    tower.fall_zone_pct_of_height !== null && tower.fall_zone_pct_of_height !== undefined
+      ? `${tower.fall_zone_pct_of_height}% of tower height`
+      : null,
+    jurisdictionRecord.fall_zone_requirements,
+  ].filter(Boolean).join(" | ") || null;
+  const setbacks = [
+    tower.setback_ft !== null && tower.setback_ft !== undefined ? `${tower.setback_ft} ft` : null,
+    tower.setback_rule,
+  ].filter(Boolean).join(" | ") || null;
+
+  return {
+    ...compactRecord({
+      county: registryRecord?.county || (/\bcounty\b/i.test(jurisdiction) ? jurisdiction : null),
+      state,
+      last_updated: tower.last_ingested_at || jurisdictionRecord.last_researched_at || null,
+    }),
+    zoning_overview: compactRecord({
+      jurisdiction: jurisdictionRecord.zoning_jurisdiction || jurisdictionRecord.name || jurisdiction,
+      contact_information: joinContact(
+        jurisdictionRecord.zoning_contact_name,
+        jurisdictionRecord.zoning_contact_email,
+        jurisdictionRecord.zoning_contact_phone,
+      ),
+      process: jurisdictionRecord.zoning_process || tower.zoning_process,
+      permit_type_required: tower.permit_type,
+      fees: jurisdictionRecord.zoning_fees,
+      approval_timeframe: jurisdictionRecord.zoning_approval_timeframe || tower.zoning_approval_timeframe,
+    }),
+    tower_specifics: compactRecord({
+      ldc_section_references: jurisdictionRecord.ldc_section_reference || tower.section_ref,
+      maximum_tower_height: tower.height_limit_ft !== null && tower.height_limit_ft !== undefined
+        ? `${tower.height_limit_ft} ft`
+        : jurisdictionRecord.max_tower_height_ft !== null && jurisdictionRecord.max_tower_height_ft !== undefined
+          ? `${jurisdictionRecord.max_tower_height_ft} ft`
+          : null,
+      setbacks,
+      stealth_required: yesNo(tower.stealth_required ?? jurisdictionRecord.stealth_required),
+      required_collocations: tower.required_collocations_count ?? jurisdictionRecord.required_collocations,
+      residential_separation: tower.residential_separation_ft !== null && tower.residential_separation_ft !== undefined
+        ? `${tower.residential_separation_ft} ft`
+        : formattedDistance(jurisdictionRecord.residential_separation, jurisdictionRecord.residential_separation_unit),
+      tower_separation: tower.tower_separation_ft !== null && tower.tower_separation_ft !== undefined
+        ? `${tower.tower_separation_ft} ft`
+        : formattedDistance(jurisdictionRecord.tower_separation, jurisdictionRecord.tower_separation_unit),
+      measured_from: tower.measured_from || jurisdictionRecord.measured_from,
+      fall_zone_requirements: fallZone,
+      pe_letter_fall_zone_relief: yesNo(tower.pe_fall_zone_allowed),
+      special_tower_landscaping: tower.landscaping_details || yesNo(tower.landscaping_required ?? jurisdictionRecord.special_tower_landscaping),
+    }),
+    site_plan_overview: compactRecord({
+      jurisdiction: jurisdictionRecord.site_plan_jurisdiction,
+      contact_information: joinContact(
+        jurisdictionRecord.site_plan_contact_name,
+        jurisdictionRecord.site_plan_contact_email,
+        jurisdictionRecord.site_plan_contact_phone,
+      ),
+      fees: jurisdictionRecord.site_plan_fees,
+      timeframe_for_approval: jurisdictionRecord.site_plan_timeframe,
+      existing_site_plan_to_amend: yesNo(jurisdictionRecord.existing_site_plan_to_amend),
+      concurrent_to_zoning_or_bp: yesNo(jurisdictionRecord.concurrent_to_zoning_or_bp),
+      submittal_deadlines: jurisdictionRecord.site_plan_submittal_deadlines,
+      electronic_hard_copy_or_both: jurisdictionRecord.site_plan_submission_format,
+    }),
+    building_permit_information: compactRecord({
+      jurisdiction: jurisdictionRecord.building_permit_jurisdiction,
+      building_department_contact: joinContact(
+        jurisdictionRecord.building_dept_contact_name,
+        jurisdictionRecord.building_dept_contact_email,
+        jurisdictionRecord.building_dept_contact_phone,
+      ),
+      does_gc_have_to_submit: yesNo(jurisdictionRecord.gc_must_submit),
+      fees: jurisdictionRecord.building_permit_fees,
+      timeframe: jurisdictionRecord.building_permit_timeframe,
+      bond_required: yesNo(jurisdictionRecord.bond_required),
+      e911_address_assigned: yesNo(jurisdictionRecord.e911_address_assigned),
+    }),
+    source_urls: compactRecord({
+      zoning_ordinance: sourceFor(["wireless_telecom_ordinance", "zoning_ordinance"]),
+      planning_dept: sourceFor(["planning_application", "conditional_use_or_special_use"]),
+      building_dept: sourceFor(["building_department", "permit_portal"]),
+      gis: sourceFor(["zoning_map"], /\bgis\b|parcel|assess|zoning.?map/i),
+    }),
+  };
+}
+
+function citationsFromRecords(
+  jurisdictionRecord: Record<string, any> | null,
+  telecomRecord: Record<string, any> | null,
+): Array<Record<string, any>> {
+  const seen = new Set<string>();
+  const citations: Array<Record<string, any>> = [];
+  for (const map of [asRecord(jurisdictionRecord?.field_citations), asRecord(telecomRecord?.field_citations)]) {
+    for (const [field, rawCitation] of Object.entries(map || {})) {
+      const citation = asRecord(rawCitation);
+      if (!citation) continue;
+      const key = [citation.source_url, citation.section_ref, citation.quote]
+        .map((value) => String(value || ""))
+        .join("|");
+      if (!key.replace(/\|/g, "") || seen.has(key)) continue;
+      seen.add(key);
+      citations.push({ field, ...citation });
+    }
+  }
+  return citations;
+}
+
 async function listChildren(blockId: string): Promise<Array<Record<string, unknown>>> {
   const children: Array<Record<string, unknown>> = [];
   let cursor: string | undefined;
@@ -399,9 +563,25 @@ export async function enrichZoningData(options: EnrichmentOptions) {
     const ingest = await sendToBase44({ run_id: runId, jurisdiction, state, sources: scraped });
     if (!ingest.ok) throw new Error(`Base44 ingest failed (${ingest.status}): ${ingest.error || "unknown error"}`);
     const summary = (ingest.summary || {}) as Record<string, any>;
-    const profile = summary.county_profile;
+    const jurisdictionRecord = unwrapRecord(summary.jurisdiction_record);
+    const telecomRecord = unwrapRecord(summary.telecom_ordinance);
+    const registryRecord = unwrapRecord(summary.registry);
+    const profile = asRecord(summary.county_profile)
+      || asRecord(telecomRecord?.county_profile)
+      || (jurisdictionRecord
+        ? canonicalRecordsToProfile(
+            jurisdictionRecord,
+            telecomRecord,
+            registryRecord,
+            summary.resources,
+            jurisdiction,
+            state,
+          )
+        : null);
     if (!profile || typeof profile !== "object") throw new Error("Base44 completed the ingest but did not return the enriched county profile.");
-    const citations = Array.isArray(summary.citations) ? summary.citations : [];
+    const citations = Array.isArray(summary.citations)
+      ? summary.citations
+      : citationsFromRecords(jurisdictionRecord, telecomRecord);
     const stats = summary.extraction || {};
     const notion = options.writeToNotion === false
       ? null

@@ -39,18 +39,46 @@ export interface ScrapedSource {
   chars: number;
 }
 
+export interface Base44DestinationProof {
+  verified: boolean;
+  canonical_key?: string;
+  canonical_version?: string;
+  projections_linked?: boolean;
+  raw_verified?: boolean;
+  record_ids?: {
+    registry?: string | null;
+    jurisdiction?: string | null;
+    telecom_ordinance?: string | null;
+    zoning_ordinance?: string | null;
+  };
+}
+
+export interface Base44IngestResult {
+  ok: boolean;
+  skipped?: boolean;
+  status: number;
+  summary?: unknown;
+  error?: string;
+  destination_verified?: Base44DestinationProof;
+  canonical_key?: string;
+  canonical_version?: string;
+  base44_record_ids?: Record<string, string | null | undefined>;
+}
+
 export interface JurisdictionResult {
   jurisdiction: string;
   state: string;
   sources: Array<Pick<ScrapedSource, "url" | "authority_level" | "ok" | "method" | "chars" | "error">>;
   polygon_found: boolean;
-  ingest: { ok: boolean; status: number; summary?: unknown; error?: string };
+  ingest: Base44IngestResult;
   seconds: number;
 }
 
 export interface RunOptions {
   state?: string;
   jurisdiction?: string;
+  /** Internal queue contract: run these exact names, in this exact order. */
+  expectedJurisdictions?: string[];
   limit?: number;
   offset?: number;
   dryRun?: boolean;
@@ -254,6 +282,21 @@ export function selectGroups(groups: JurisdictionGroup[], opts: RunOptions): Jur
     const needle = opts.jurisdiction.toLowerCase();
     out = out.filter((g) => g.jurisdiction.toLowerCase().includes(needle));
   }
+  if (opts.expectedJurisdictions) {
+    if (!opts.expectedJurisdictions.length) {
+      throw new Error("The queue supplied an empty exact jurisdiction claim.");
+    }
+    const uniqueNames = new Set(opts.expectedJurisdictions);
+    if (uniqueNames.size !== opts.expectedJurisdictions.length) {
+      throw new Error("The queue supplied duplicate exact jurisdiction names.");
+    }
+    const byName = new Map(out.map((group) => [group.jurisdiction, group]));
+    const missing = opts.expectedJurisdictions.filter((name) => !byName.has(name));
+    if (missing.length) {
+      throw new Error(`The persisted queue claim no longer exists in Notion: ${missing.join(", ")}`);
+    }
+    return opts.expectedJurisdictions.map((name) => byName.get(name)!);
+  }
   const offset = Math.max(0, opts.offset ?? 0);
   const limit = Math.max(1, Math.min(opts.limit ?? 25, 500));
   return out.slice(offset, offset + limit);
@@ -445,7 +488,167 @@ async function getJurisdictionPolygon(jurisdiction: string, state: string): Prom
 }
 
 // ---------- Base44 intake ----------
-export async function sendToBase44(payload: unknown): Promise<{ ok: boolean; status: number; summary?: unknown; error?: string }> {
+function asRecord(value: unknown): Record<string, any> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, any>
+    : null;
+}
+
+function nonempty(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const text = value.trim();
+  return text || null;
+}
+
+function identity(value: unknown): string | null {
+  const text = nonempty(value);
+  return text ? text.replace(/\s+/g, " ").toLowerCase() : null;
+}
+
+function inferredAuthorityHint(jurisdiction: string): string {
+  const normalized = jurisdiction.toLowerCase();
+  if (/\bcounty\b/.test(normalized)) return "county";
+  if (/\btownship\b/.test(normalized)) return "township";
+  if (/\bvillage\b/.test(normalized)) return "village";
+  if (/\bcity\b/.test(normalized)) return "city";
+  return "municipality";
+}
+
+// Keep this identity check aligned with Base44 shared/canonicalZoning.ts. It
+// binds a valid-looking proof to the jurisdiction that Railway actually sent,
+// instead of accepting two internally matching keys for the wrong destination.
+function expectedCanonicalKey(state: string, jurisdiction: string, suppliedAuthority?: unknown): string {
+  const hint = `${nonempty(suppliedAuthority) || inferredAuthorityHint(jurisdiction)} ${jurisdiction}`.toLowerCase();
+  const authorityKind = /\bstate\b/.test(hint)
+    ? "state"
+    : /special\s+district|authority|district/.test(hint)
+      ? "special_district"
+      : /township/.test(hint)
+        ? "township"
+        : /county|parish|county[- ]equivalent|unincorporated[_ -]county|census area/.test(hint)
+          || (state === "AK" && /borough|municipality/.test(hint))
+          ? "county"
+          : /city|town|village|borough|municipal|municipality/.test(hint)
+            ? "municipality"
+            : "unknown";
+  let name = jurisdiction
+    .replace(/\s+/g, " ")
+    .trim()
+    .toUpperCase()
+    .replace(/^\s*[A-Z]{2}\s*[-:]\s*/, "")
+    .replace(/&/g, " AND ")
+    .replace(/[^A-Z0-9 ]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/^(?:CITY|TOWN|VILLAGE|BOROUGH|TOWNSHIP|COUNTY) OF\s+/, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (authorityKind === "county") {
+    name = name.replace(/\s+(?:COUNTY|PARISH|BOROUGH|CENSUS AREA|MUNICIPALITY)$/, "").trim();
+  } else if (authorityKind === "municipality") {
+    name = name.replace(/\s+(?:CITY|TOWN|VILLAGE|BOROUGH)$/, "").trim();
+  } else if (authorityKind === "township") {
+    name = name.replace(/\s+(?:CHARTER )?TOWNSHIP$/, "").trim();
+  }
+  return `US|${state}|${authorityKind}|${name}`;
+}
+
+function requestRequiresRaw(request: Record<string, any> | null): boolean {
+  if (!request || request.skip_extraction === true || !Array.isArray(request.sources)) return false;
+  return request.sources.some((value: unknown) => {
+    const source = asRecord(value);
+    return source?.ok !== false
+      && typeof source?.text === "string"
+      && source.text.length > 200;
+  });
+}
+
+export function verifyBase44IngestResponse(
+  responseBody: unknown,
+  requestPayload: unknown,
+): { ok: true; proof: Base44DestinationProof; body: Record<string, any> } | { ok: false; error: string; proof?: Base44DestinationProof } {
+  const body = asRecord(responseBody);
+  const request = asRecord(requestPayload);
+  const proofRecord = asRecord(body?.destination_verified);
+  const proof = proofRecord as Base44DestinationProof | null;
+  const proofIds = asRecord(proofRecord?.record_ids) || {};
+  const returnedIds = asRecord(body?.base44_record_ids) || {};
+  const fail = (error: string) => ({
+    ok: false as const,
+    error,
+    ...(proof ? { proof } : {}),
+  });
+
+  if (!body) return fail("Base44 response body is not a JSON object");
+  if (body.ok !== true) return fail("Base44 response did not contain boolean ok=true");
+  if (proofRecord?.verified !== true || proofRecord?.projections_linked !== true) {
+    return fail("missing or failed destination_verified proof");
+  }
+
+  const canonicalKey = nonempty(body.canonical_key);
+  const proofCanonicalKey = nonempty(proofRecord.canonical_key);
+  if (!canonicalKey || !proofCanonicalKey || canonicalKey !== proofCanonicalKey) {
+    return fail("canonical_key is missing or inconsistent with destination proof");
+  }
+  const canonicalVersion = nonempty(body.canonical_version);
+  const proofCanonicalVersion = nonempty(proofRecord.canonical_version);
+  if (!canonicalVersion || !proofCanonicalVersion || canonicalVersion !== proofCanonicalVersion) {
+    return fail("canonical_version is missing or inconsistent with destination proof");
+  }
+
+  if (!request) return fail("request payload is not a JSON object");
+  const responseState = nonempty(body.state);
+  const requestState = nonempty(request.state);
+  if (!responseState || !requestState || toStateCode(responseState) !== toStateCode(requestState)) {
+    return fail("Base44 response state does not match the requested state");
+  }
+  const responseJurisdiction = identity(body.jurisdiction);
+  const requestJurisdiction = identity(request.jurisdiction);
+  if (!responseJurisdiction || !requestJurisdiction || responseJurisdiction !== requestJurisdiction) {
+    return fail("Base44 response jurisdiction does not match the requested jurisdiction");
+  }
+  const expectedKey = expectedCanonicalKey(
+    toStateCode(requestState),
+    request.jurisdiction as string,
+    request.authority_kind,
+  );
+  if (canonicalKey !== expectedKey) {
+    return fail(`canonical_key does not match the requested jurisdiction identity (${expectedKey})`);
+  }
+
+  const idPairs: Array<[string, unknown, unknown]> = [
+    ["registry", proofIds.registry, returnedIds.jurisdiction_registry_id],
+    ["jurisdiction", proofIds.jurisdiction, returnedIds.jurisdiction_id],
+    ["telecom_ordinance", proofIds.telecom_ordinance, returnedIds.telecom_ordinance_id],
+  ];
+  for (const [name, proofIdRaw, returnedIdRaw] of idPairs) {
+    const proofId = nonempty(proofIdRaw);
+    const returnedId = nonempty(returnedIdRaw);
+    if (!proofId || !returnedId || proofId !== returnedId) {
+      return fail(`Base44 ${name} record ID is missing or inconsistent with destination proof`);
+    }
+  }
+
+  const requireRaw = requestRequiresRaw(request);
+  const extractionAction = nonempty(asRecord(body.extraction)?.action);
+  if (requireRaw && extractionAction !== "done") {
+    return fail("Base44 did not complete extraction for usable source content");
+  }
+  if (!requireRaw && extractionAction !== "skipped") {
+    return fail("Base44 extraction action is inconsistent with the request/source content");
+  }
+  if (requireRaw) {
+    const proofRawId = nonempty(proofIds.zoning_ordinance);
+    const returnedRawId = nonempty(returnedIds.zoning_ordinance_id);
+    if (proofRecord.raw_verified !== true || !proofRawId || !returnedRawId || proofRawId !== returnedRawId) {
+      return fail("destination proof did not verify the raw ZoningOrdinance archive");
+    }
+  }
+
+  return { ok: true, proof: proof as Base44DestinationProof, body };
+}
+
+export async function sendToBase44(payload: unknown): Promise<Base44IngestResult> {
   const endpoint = requiredEnv("BASE44_ZONING_INGEST");
   const secret = optionalEnv("BASE44_WEBHOOK_SECRET", "BASE44_API_KEY");
   if (!secret) throw new Error("Missing BASE44_WEBHOOK_SECRET (or BASE44_API_KEY)");
@@ -459,10 +662,41 @@ export async function sendToBase44(payload: unknown): Promise<{ ok: boolean; sta
       timeout: 180000,
       validateStatus: () => true,
     });
-    const ok = response.status >= 200 && response.status < 300;
-    return ok
-      ? { ok, status: response.status, summary: response.data }
-      : { ok, status: response.status, error: typeof response.data === "string" ? response.data.slice(0, 500) : JSON.stringify(response.data).slice(0, 500) };
+    const httpOk = response.status >= 200 && response.status < 300;
+    if (!httpOk) {
+      return {
+        ok: false,
+        status: response.status,
+        error: typeof response.data === "string"
+          ? response.data.slice(0, 500)
+          : JSON.stringify(response.data).slice(0, 500),
+      };
+    }
+
+    const body = asRecord(response.data);
+    const verified = verifyBase44IngestResponse(response.data, payload);
+    if (!verified.ok) {
+      return {
+        ok: false,
+        status: response.status,
+        summary: response.data,
+        destination_verified: verified.proof,
+        canonical_key: typeof body?.canonical_key === "string" ? body.canonical_key : undefined,
+        canonical_version: typeof body?.canonical_version === "string" ? body.canonical_version : undefined,
+        base44_record_ids: asRecord(body?.base44_record_ids) || undefined,
+        error: `Base44 returned HTTP ${response.status} but did not prove the canonical write: ${verified.error}`,
+      };
+    }
+
+    return {
+      ok: true,
+      status: response.status,
+      summary: response.data,
+      destination_verified: verified.proof,
+      canonical_key: verified.body.canonical_key,
+      canonical_version: verified.body.canonical_version,
+      base44_record_ids: asRecord(verified.body.base44_record_ids) || undefined,
+    };
   } catch (err) {
     return { ok: false, status: 0, error: err instanceof Error ? err.message : String(err) };
   }
@@ -499,8 +733,8 @@ export async function runScraper(opts: RunOptions = {}, onProgress?: (r: Jurisdi
     const scraped = await scrapeGroup(group);
     const polygon = opts.includePolygon === false ? null : await getJurisdictionPolygon(group.jurisdiction, group.state);
 
-    const ingest = opts.dryRun
-      ? { ok: true, status: 0, summary: "dry run — not sent" }
+    const ingest: Base44IngestResult = opts.dryRun
+      ? { ok: false, skipped: true, status: 0, summary: "dry run — not sent" }
       : await sendToBase44({
           run_id,
           jurisdiction: group.jurisdiction,
@@ -529,7 +763,10 @@ export async function runScraper(opts: RunOptions = {}, onProgress?: (r: Jurisdi
     summary.processed += 1;
     summary.urls_scraped_ok += scraped.filter((s) => s.ok).length;
     summary.urls_failed += scraped.filter((s) => !s.ok).length;
-    if (ingest.ok) summary.ingested_ok += 1; else summary.ingested_failed += 1;
+    if (!ingest.skipped) {
+      if (ingest.ok) summary.ingested_ok += 1;
+      else summary.ingested_failed += 1;
+    }
     summary.results.push(result);
     onProgress?.(result, summary.processed, selected.length);
   }

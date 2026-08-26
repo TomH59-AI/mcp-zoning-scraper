@@ -1,9 +1,10 @@
 {
   "name": "mcp-zoning-scraper",
-  "version": "1.0.0",
+  "version": "2.3.0",
   "type": "module",
   "scripts": {
     "build": "tsc",
+    "test": "npm run build && node --test dist/tools/runScraper.test.js dist/tools/queue.test.js",
     "start": "node dist/src/server.js"
   },
   "dependencies": {

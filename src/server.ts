@@ -14,7 +14,20 @@ import {
   type RunOptions,
   type RunSummary
 } from "../tools/runScraper.js";
-import { loadQueue, saveQueue, resetQueue, planNextBatch } from "../tools/queue.js";
+import {
+  claimQueueBatch,
+  finishQueueIfCurrent,
+  groupsForState,
+  heartbeatQueueClaim,
+  isQueueClaimStale,
+  loadQueue,
+  planNextBatch,
+  queueStorageStatus,
+  resetQueue,
+  settleQueueClaim,
+  type QueueClaimIdentity,
+  type QueueFailureLatch,
+} from "../tools/queue.js";
 import {
   enrichZoningData,
   listEnrichmentQueue,
@@ -32,18 +45,52 @@ interface Job {
   options: RunOptions;
   done: number;
   total: number;
-  last?: { jurisdiction: string; state: string; ok: boolean; seconds: number };
+  last?: {
+    jurisdiction: string;
+    state: string;
+    ok: boolean;
+    skipped?: boolean;
+    status: number;
+    error?: string;
+    canonical_key?: string;
+    canonical_version?: string;
+    destination_verified?: unknown;
+    seconds: number;
+  };
   recent: JurisdictionResult[];
   summary?: RunSummary;
   error?: string;
-  queue?: { state: string; offset: number; stateIndex: number };
+  queue?: {
+    state: string;
+    offset: number;
+    stateIndex: number;
+    startedAt: string | null;
+    batchSize: number;
+    jurisdictions: string[];
+  };
 }
 const jobs = new Map<string, Job>();
 let activeJob: Job | null = null;
+let queuePersistenceBlocked: string | null = null;
+let queueLaunchInProgress = false;
 
-function startJob(options: RunOptions, queue?: { state: string; offset: number; stateIndex: number }): Job {
+function queueClaimIdentity(job: Job): QueueClaimIdentity {
+  if (!job.queue?.startedAt) {
+    throw new Error("Queue job is missing its persisted generation identifier.");
+  }
+  return {
+    job_id: job.id,
+    generation: job.queue.startedAt,
+    state: job.queue.state,
+    stateIndex: job.queue.stateIndex,
+    offset: job.queue.offset,
+    jurisdictions: job.queue.jurisdictions,
+  };
+}
+
+function startJob(options: RunOptions, queue?: Job["queue"], claimedJobId?: string): Job {
   const job: Job = {
-    id: randomUUID().slice(0, 8),
+    id: claimedJobId ?? randomUUID().slice(0, 8),
     status: "running",
     started_at: new Date().toISOString(),
     options,
@@ -55,56 +102,183 @@ function startJob(options: RunOptions, queue?: { state: string; offset: number; 
   jobs.set(job.id, job);
   activeJob = job;
 
+  const heartbeat = queue
+    ? setInterval(() => {
+        try {
+          heartbeatQueueClaim(queueClaimIdentity(job));
+        } catch (error) {
+          console.error(`[queue] claim heartbeat failed for ${job.id}: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }, 30_000)
+    : null;
+  heartbeat?.unref();
+
   void runScraper(options, (result, done, total) => {
     job.done = done;
     job.total = total;
-    job.last = { jurisdiction: result.jurisdiction, state: result.state, ok: result.ingest.ok, seconds: result.seconds };
+    job.last = {
+      jurisdiction: result.jurisdiction,
+      state: result.state,
+      ok: result.ingest.ok,
+      skipped: result.ingest.skipped,
+      status: result.ingest.status,
+      error: result.ingest.error,
+      canonical_key: result.ingest.canonical_key,
+      canonical_version: result.ingest.canonical_version,
+      destination_verified: result.ingest.destination_verified,
+      seconds: result.seconds,
+    };
     job.recent.unshift(result);
     if (job.recent.length > 10) job.recent.pop();
-    console.log(`[job ${job.id}] ${done}/${total} ${result.jurisdiction}, ${result.state} → ingest ${result.ingest.ok ? "ok" : `FAILED ${result.ingest.status} ${result.ingest.error ?? ""}`}`);
+    const outcome = result.ingest.skipped
+      ? "skipped (dry run)"
+      : result.ingest.ok
+        ? "verified"
+        : `FAILED ${result.ingest.status} ${result.ingest.error ?? ""}`;
+    console.log(`[job ${job.id}] ${done}/${total} ${result.jurisdiction}, ${result.state} → ingest ${outcome}`);
   })
     .then((summary) => {
-      job.status = "done";
       job.summary = { ...summary, results: summary.results.slice(-25) };
       job.finished_at = new Date().toISOString();
-      // Only a batch that actually ran moves the cursor — a failed job must be
-      // retried at the same offset, not skipped past.
-      advanceQueueAfter(job, summary);
+      if (job.queue) {
+        const advanced = settleQueueAfter(job, summary);
+        job.status = advanced ? "done" : "failed";
+      } else {
+        job.status = "done";
+      }
     })
     .catch((err: unknown) => {
       job.status = "failed";
       job.error = err instanceof Error ? err.message : String(err);
       job.finished_at = new Date().toISOString();
+      if (job.queue) {
+        try {
+          latchQueueJobError(job, job.error);
+        } catch (latchError) {
+          queuePersistenceBlocked = latchError instanceof Error ? latchError.message : String(latchError);
+          console.error(`[queue] safety latch persistence failed; queue blocked in memory: ${queuePersistenceBlocked}`);
+        }
+      }
     })
     .finally(() => {
+      if (heartbeat) clearInterval(heartbeat);
       if (activeJob?.id === job.id) activeJob = null;
     });
 
   return job;
 }
 
-// Advance the shared cursor when a queue-driven batch finishes, so the next
-// scheduled firing picks up where this one stopped rather than repeating it.
-function advanceQueueAfter(job: Job, summary: RunSummary): void {
+function failureDetails(summary: RunSummary) {
+  return summary.results
+    .filter((result) => !result.ingest.ok && !result.ingest.skipped)
+    .map((result) => ({
+      jurisdiction: result.jurisdiction,
+      status: result.ingest.status,
+      error: result.ingest.error,
+      canonical_key: result.ingest.canonical_key,
+    }));
+}
+
+// Settle a queue-driven batch. A single unverified Base44 write freezes the
+// exact cursor and latches the failure; ordinary scheduled calls cannot retry
+// it or move past it.
+function settleQueueAfter(job: Job, summary: RunSummary): boolean {
+  if (!job.queue) return true;
+  const failures = failureDetails(summary);
+  const actualJurisdictions = summary.results.map((result) => result.jurisdiction);
+  const expectedJurisdictions = job.queue.jurisdictions;
+  const exactBatchRan =
+    summary.processed === expectedJurisdictions.length
+    && actualJurisdictions.length === expectedJurisdictions.length
+    && actualJurisdictions.every((name, index) => name === expectedJurisdictions[index])
+    && summary.results.every((result) => !result.ingest.skipped);
+  const executionError = !exactBatchRan
+    ? `The scraper result did not exactly match the persisted jurisdiction claim. Expected [${expectedJurisdictions.join(", ")}], received [${actualJurisdictions.join(", ")}].`
+    : undefined;
+  const failed = failures.length > 0 || summary.dry_run || Boolean(executionError);
+  let settledOffset = job.queue.offset;
+  let batchesRun = 0;
+  let jurisdictionsDone = 0;
+
+  settleQueueClaim(queueClaimIdentity(job), (q) => {
+    q.batches_run += 1;
+    q.last_batch = {
+      job_id: job.id,
+      state: job.queue!.state,
+      offset: job.queue!.offset,
+      processed: summary.processed,
+      ingested_ok: summary.ingested_ok,
+      ingested_failed: summary.ingested_failed,
+      failed,
+      error: executionError,
+      finished_at: new Date().toISOString(),
+    };
+
+    if (failed) {
+      const latch: QueueFailureLatch = {
+        kind: failures.length ? "base44_ingest" : "job_error",
+        job_id: job.id,
+        state: job.queue!.state,
+        stateIndex: job.queue!.stateIndex,
+        offset: job.queue!.offset,
+        batch_size: job.queue!.batchSize,
+        jurisdictions: [...job.queue!.jurisdictions],
+        failed_at: new Date().toISOString(),
+        failures,
+        error: executionError ?? (summary.dry_run ? "A queue batch ran in dry-run mode; cursor was not advanced." : undefined),
+      };
+      q.ingested_failed += failures.length;
+      q.failure_latch = latch;
+      job.error = failures.length
+        ? `${failures.length} Base44 ingestion(s) failed strict destination verification; queue is latched at the same cursor.`
+        : latch.error;
+      return;
+    }
+
+    q.offset = job.queue!.offset + expectedJurisdictions.length;
+    q.stateIndex = job.queue!.stateIndex;
+    q.jurisdictions_done += expectedJurisdictions.length;
+    q.ingested_ok += summary.ingested_ok;
+    q.failure_latch = null;
+    settledOffset = q.offset;
+    batchesRun = q.batches_run;
+    jurisdictionsDone = q.jurisdictions_done;
+  });
+
+  if (failed) {
+    console.error(`[queue] latched ${job.queue.state} offset ${job.queue.offset}: ${job.error}`);
+    return false;
+  }
+  console.log(`[queue] ${job.queue.state} offset ${job.queue.offset} -> ${settledOffset} (batch ${batchesRun}, ${jurisdictionsDone} jurisdictions done)`);
+  return true;
+}
+
+function latchQueueJobError(job: Job, error: string): void {
   if (!job.queue) return;
-  const q = loadQueue();
-  q.offset = job.queue.offset + (summary.processed || 0);
-  q.stateIndex = job.queue.stateIndex;
-  q.batches_run += 1;
-  q.jurisdictions_done += summary.processed || 0;
-  q.ingested_ok += summary.ingested_ok || 0;
-  q.ingested_failed += summary.ingested_failed || 0;
-  q.last_batch = {
-    job_id: job.id,
-    state: job.queue.state,
-    offset: job.queue.offset,
-    processed: summary.processed,
-    ingested_ok: summary.ingested_ok,
-    ingested_failed: summary.ingested_failed,
-    finished_at: new Date().toISOString()
-  };
-  saveQueue(q);
-  console.log(`[queue] ${job.queue.state} offset ${job.queue.offset} -> ${q.offset} (batch ${q.batches_run}, ${q.jurisdictions_done} jurisdictions done)`);
+  settleQueueClaim(queueClaimIdentity(job), (q) => {
+    q.batches_run += 1;
+    q.failure_latch = {
+      kind: "job_error",
+      job_id: job.id,
+      state: job.queue!.state,
+      stateIndex: job.queue!.stateIndex,
+      offset: job.queue!.offset,
+      batch_size: job.queue!.batchSize,
+      jurisdictions: [...job.queue!.jurisdictions],
+      failed_at: new Date().toISOString(),
+      failures: [],
+      error,
+    };
+    q.last_batch = {
+      job_id: job.id,
+      state: job.queue!.state,
+      offset: job.queue!.offset,
+      processed: job.done,
+      failed: true,
+      error,
+      finished_at: new Date().toISOString(),
+    };
+  });
 }
 
 function jobView(job: Job) {
@@ -122,7 +296,13 @@ function jobView(job: Job) {
       urls_ok: r.sources.filter((s) => s.ok).length,
       urls_failed: r.sources.filter((s) => !s.ok).length,
       ingest_ok: r.ingest.ok,
+      ingest_skipped: r.ingest.skipped === true,
+      ingest_status: r.ingest.status,
       ingest_error: r.ingest.error,
+      canonical_key: r.ingest.canonical_key,
+      canonical_version: r.ingest.canonical_version,
+      base44_record_ids: r.ingest.base44_record_ids,
+      destination_verified: r.ingest.destination_verified,
       seconds: r.seconds
     })),
     summary: job.summary
@@ -158,7 +338,7 @@ const selectionShape = {
 };
 
 function createServer(): McpServer {
-  const server = new McpServer({ name: "mcp-zoning-scraper", version: "2.2.0" });
+  const server = new McpServer({ name: "mcp-zoning-scraper", version: "2.3.0" });
 
   server.registerTool(
     "listZoningSources",
@@ -278,12 +458,54 @@ function createServer(): McpServer {
       description:
         "Begin (or restart) a multi-state sweep of the Notion zoning library. Sets the durable cursor; does not scrape anything by itself — call runNextBatch to do the work. Use this once, then let a scheduled task call runNextBatch repeatedly.",
       inputSchema: {
-        states: z.array(z.string()).min(1).describe("States in the order to sweep, e.g. ['FL','NC','GA']")
+        states: z.array(z.string()).min(1).describe("States in the order to sweep, e.g. ['FL','NC','GA']"),
+        forceReset: z.literal(true).optional().describe("Required to abandon a latched failed sweep and create a new queue generation."),
       }
     },
-    async ({ states }) => {
+    async ({ states, forceReset }) => {
       try {
-        const q = resetQueue(states);
+        const storage = queueStorageStatus();
+        if (storage.temporary_default) {
+          return text({
+            ok: false,
+            blocked: true,
+            error: "Attach a Railway persistent volume (RAILWAY_VOLUME_MOUNT_PATH) or set QUEUE_FILE to durable storage before creating a sweep.",
+            queue_storage: storage,
+          });
+        }
+        if (activeJob || queueLaunchInProgress) {
+          return text({
+            ok: false,
+            error: activeJob
+              ? `Cannot reset while job ${activeJob.id} is running.`
+              : "Cannot reset while a queue batch is being claimed.",
+          });
+        }
+        const current = loadQueue();
+        if (current.in_flight) {
+          const stale = isQueueClaimStale(current.in_flight);
+          if (!stale || forceReset !== true) {
+            return text({
+              ok: false,
+              blocked: true,
+              error: stale
+                ? "A stale in-flight batch owns this queue. Pass forceReset=true only if you intend to abandon it."
+                : "Another Railway process still has a live in-flight batch; reset was refused.",
+              in_flight: current.in_flight,
+              stale,
+            });
+          }
+        }
+        if (current.failure_latch && forceReset !== true) {
+          return text({
+            ok: false,
+            blocked: true,
+            error: "The current sweep has a failure latch. Pass forceReset=true only if you intend to abandon that failed cursor.",
+            failure_latch: current.failure_latch,
+          });
+        }
+        const q = resetQueue(states, { forceReset: forceReset === true });
+        queuePersistenceBlocked = null;
         const { plan } = await planNextBatch(q, 1);
         return text({ ok: true, queue: q, up_next: plan });
       } catch (err) {
@@ -299,11 +521,32 @@ function createServer(): McpServer {
         "Scrape the next N jurisdictions in the sweep and push them to SiteHawk (Base44), then advance the durable cursor. Safe to call on a schedule: it returns immediately with a job_id, refuses to double-run while a job is in flight, and resumes at the right place after a redeploy. Returns done:true when every state in the sweep is finished.",
       inputSchema: {
         batch: z.number().int().min(1).max(25).optional().describe("Jurisdictions this batch (default 3)"),
-        dryRun: z.boolean().optional().describe("Scrape without writing to Base44")
+        retryFailed: z.literal(true).optional().describe("Operator-only explicit retry of the currently latched batch at the unchanged cursor."),
+        dryRun: z.boolean().optional().describe("Deprecated compatibility flag. true is blocked; use runScraper for a non-writing preview."),
       }
     },
-    async ({ batch, dryRun }) => {
+    async ({ batch, retryFailed, dryRun }) => {
       try {
+        if (dryRun === true) {
+          return text({
+            ok: false,
+            blocked: true,
+            started: false,
+            error: "runNextBatch dryRun compatibility request was blocked; no job started and no Base44 writes were made. Use runScraper with dryRun=true for a non-writing preview.",
+          });
+        }
+        const storage = queueStorageStatus();
+        if (storage.temporary_default) {
+          return text({
+            ok: false,
+            blocked: true,
+            error: "Attach a Railway persistent volume (RAILWAY_VOLUME_MOUNT_PATH) or set QUEUE_FILE to durable storage before running a sweep.",
+            queue_storage: storage,
+          });
+        }
+        if (queuePersistenceBlocked) {
+          return text({ ok: false, blocked: true, error: `Queue persistence safety block: ${queuePersistenceBlocked}` });
+        }
         if (activeJob) {
           return text({
             ok: true,
@@ -312,27 +555,154 @@ function createServer(): McpServer {
             job_id: activeJob.id
           });
         }
-        const size = batch ?? 3;
-        const q = loadQueue();
-        if (!q.states.length) {
-          return text({ ok: false, error: "No sweep configured — call startZoningSweep with the states first." });
+        if (queueLaunchInProgress) {
+          return text({
+            ok: true,
+            started: false,
+            skipped: "claim_in_progress",
+            message: "Another request in this Railway process is already claiming the next batch.",
+          });
         }
-        const { plan, state: advanced } = await planNextBatch(q, size);
-        if (plan.done) {
-          if (!advanced.finished_at) {
-            advanced.finished_at = new Date().toISOString();
-            saveQueue(advanced);
+
+        // Set this before the first await. activeJob is not populated until
+        // after Notion planning, so it cannot by itself close this launch race.
+        queueLaunchInProgress = true;
+        try {
+          const requestedSize = batch ?? 3;
+          const q = loadQueue();
+          if (!q.states.length) {
+            return text({ ok: false, error: "No sweep configured — call startZoningSweep with the states first." });
           }
-          return text({ ok: true, done: true, queue: advanced, message: "Sweep complete — every state has been scraped." });
+          if (!q.started_at) {
+            return text({ ok: false, blocked: true, error: "The configured queue has no generation identifier; reset it before running." });
+          }
+          if (q.in_flight) {
+            const stale = isQueueClaimStale(q.in_flight);
+            return text({
+              ok: true,
+              started: false,
+              blocked: true,
+              skipped: stale ? "stale_job_in_flight" : "job_in_flight_other_process",
+              message: stale
+                ? "A stale persisted batch claim was found. It will not be reused or bypassed; an operator must explicitly reset the sweep."
+                : "Another Railway process owns the current batch — nothing started.",
+              in_flight: q.in_flight,
+              stale,
+            });
+          }
+          if (q.failure_latch && retryFailed !== true) {
+            return text({
+              ok: true,
+              started: false,
+              blocked: true,
+              message: "Sweep is frozen at a failed Base44 destination-verification batch. An operator must retry or reset it.",
+              failure_latch: q.failure_latch,
+            });
+          }
+          if (!q.failure_latch && retryFailed === true) {
+            return text({ ok: false, error: "No failed batch is latched; retryFailed cannot be used as a general bypass." });
+          }
+
+          const originalCursor = {
+            generation: q.started_at,
+            stateIndex: q.stateIndex,
+            offset: q.offset,
+          };
+          const size = q.failure_latch?.batch_size || requestedSize;
+          const planned = await planNextBatch(q, size);
+          let plan = planned.plan;
+          let advanced = planned.state;
+          let retryOfJobId: string | undefined;
+
+          if (q.failure_latch) {
+            const latch = q.failure_latch;
+            if (!Array.isArray(latch.jurisdictions) || latch.jurisdictions.length === 0) {
+              return text({
+                ok: false,
+                blocked: true,
+                error: "The failed batch does not contain an exact persisted jurisdiction list; it cannot be retried safely and must be reset.",
+                failure_latch: latch,
+              });
+            }
+            if (q.stateIndex !== latch.stateIndex || q.offset !== latch.offset) {
+              return text({
+                ok: false,
+                blocked: true,
+                error: "The queue cursor no longer matches the failed batch; retry was refused.",
+                failure_latch: latch,
+              });
+            }
+
+            // The latch, not a newly calculated slice, defines a retry. We only
+            // use the fresh source list to prove those exact names still occupy
+            // the claimed cursor before allowing runScraper's offset selector.
+            const currentNames = groupsForState(planned.all, latch.state)
+              .slice(latch.offset, latch.offset + latch.jurisdictions.length)
+              .map((group) => group.jurisdiction);
+            const exactNamesStillAtCursor =
+              currentNames.length === latch.jurisdictions.length
+              && currentNames.every((name, index) => name === latch.jurisdictions[index]);
+            if (!exactNamesStillAtCursor) {
+              return text({
+                ok: false,
+                blocked: true,
+                error: "The Notion jurisdiction order changed after this batch failed. The exact latched names will not be replaced with a fresh offset slice.",
+                expected_jurisdictions: latch.jurisdictions,
+                current_jurisdictions_at_cursor: currentNames,
+              });
+            }
+            plan = {
+              ...plan,
+              done: false,
+              state: latch.state,
+              offset: latch.offset,
+              size: latch.jurisdictions.length,
+              jurisdictions: [...latch.jurisdictions],
+            };
+            advanced = { ...q, stateIndex: latch.stateIndex, offset: latch.offset };
+            retryOfJobId = latch.job_id;
+          }
+
+          if (plan.done) {
+            const finished = finishQueueIfCurrent(originalCursor, advanced);
+            return text({ ok: true, done: true, queue: finished, message: "Sweep complete — every state has been scraped." });
+          }
+
+          const jurisdictions = plan.jurisdictions ?? [];
+          if (!plan.state || plan.offset === undefined || jurisdictions.length === 0) {
+            return text({ ok: false, blocked: true, error: "The next batch plan was incomplete; nothing was claimed." });
+          }
+          const jobId = randomUUID().slice(0, 8);
+          claimQueueBatch({
+            ...originalCursor,
+            job_id: jobId,
+            state: plan.state,
+            claimedStateIndex: advanced.stateIndex,
+            claimedOffset: plan.offset,
+            batch_size: jurisdictions.length,
+            jurisdictions,
+            retry_of_job_id: retryOfJobId,
+          });
+          const job = startJob(
+            {
+              state: plan.state,
+              expectedJurisdictions: [...jurisdictions],
+              limit: jurisdictions.length,
+            },
+            {
+              state: plan.state,
+              offset: plan.offset,
+              stateIndex: advanced.stateIndex,
+              startedAt: q.started_at,
+              batchSize: jurisdictions.length,
+              jurisdictions,
+            },
+            jobId,
+          );
+          return text({ ok: true, started: true, retrying_failed_batch: retryFailed === true, batch: plan, ...jobView(job) });
+        } finally {
+          queueLaunchInProgress = false;
         }
-        // planNextBatch may have stepped over an exhausted state; persist that
-        // before the job starts so a crash cannot rewind it.
-        saveQueue(advanced);
-        const job = startJob(
-          { state: plan.state, limit: plan.size, offset: plan.offset, dryRun },
-          { state: plan.state!, offset: plan.offset!, stateIndex: advanced.stateIndex }
-        );
-        return text({ ok: true, started: true, batch: plan, ...jobView(job) });
       } catch (err) {
         return fail(err);
       }
@@ -354,6 +724,8 @@ function createServer(): McpServer {
           ok: true,
           configured: true,
           queue: q,
+          queue_storage: queueStorageStatus(),
+          persistence_blocked: queuePersistenceBlocked,
           up_next: plan,
           active_job: activeJob ? { job_id: activeJob.id, progress: `${activeJob.done}/${activeJob.total}` } : null
         });
@@ -408,7 +780,14 @@ function startHttpServer(port: number, authToken: string): void {
   });
 
   app.get("/health", (_request: Request, response: Response) => {
-    response.status(200).json({ ok: true, service: "mcp-zoning-scraper", version: "2.2.0", active_job: activeJob ? jobView(activeJob) : null });
+    response.status(200).json({
+      ok: true,
+      service: "mcp-zoning-scraper",
+      version: "2.3.0",
+      queue_storage: queueStorageStatus(),
+      queue_persistence_blocked: queuePersistenceBlocked,
+      active_job: activeJob ? jobView(activeJob) : null,
+    });
   });
 
   // Same bearer token as /mcp — handy for watching a long run from a browser/curl.

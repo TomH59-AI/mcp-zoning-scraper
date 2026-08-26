@@ -1,6 +1,6 @@
 {
   "name": "mcp-zoning-scraper",
-  "version": "1.0.0",
+  "version": "2.3.0",
   "tools": {
     "runScraper": {
       "description": "Scrape zoning + telecom rules and push to Base44",
