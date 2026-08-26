@@ -14,6 +14,7 @@ import {
   type RunOptions,
   type RunSummary
 } from "../tools/runScraper.js";
+import { getBrowserRuntimeStatus, warmBrowserRenderer } from "../tools/browserRenderer.js";
 import {
   claimQueueBatch,
   finishQueueIfCurrent,
@@ -31,7 +32,8 @@ import {
 import {
   enrichZoningData,
   listEnrichmentQueue,
-  runEnrichmentQueue
+  runEnrichmentQueue,
+  type EnrichmentOptions
 } from "../tools/enrichmentZoningData.js";
 
 dotenv.config({ path: path.resolve(process.cwd(), ".env") });
@@ -71,8 +73,26 @@ interface Job {
 }
 const jobs = new Map<string, Job>();
 let activeJob: Job | null = null;
+
+interface EnrichmentJob {
+  id: string;
+  status: "running" | "done" | "failed";
+  started_at: string;
+  finished_at?: string;
+  options: EnrichmentOptions;
+  result?: Awaited<ReturnType<typeof enrichZoningData>>;
+  error?: string;
+}
+
+const enrichmentJobs = new Map<string, EnrichmentJob>();
+let activeEnrichmentJob: EnrichmentJob | null = null;
 let queuePersistenceBlocked: string | null = null;
 let queueLaunchInProgress = false;
+const BROAD_SWEEP_BLOCK_REASON = "Broad sweep is disabled until its runner produces verified Base44, Notion, and Supabase receipts. Use Enrichment-Zoning-Data-Tool or runEnrichmentQueue for guarded delivery.";
+
+function broadSweepBlocked(): boolean {
+  return true;
+}
 
 function queueClaimIdentity(job: Job): QueueClaimIdentity {
   if (!job.queue?.startedAt) {
@@ -322,6 +342,83 @@ function jobView(job: Job) {
   };
 }
 
+function enrichmentJobKey(options: Pick<EnrichmentOptions, "jurisdiction" | "state">): string {
+  return `${options.state.trim().toUpperCase()}::${options.jurisdiction.trim().toLowerCase()}`;
+}
+
+function enrichmentJobView(job: EnrichmentJob) {
+  const result = job.result;
+  return {
+    job_id: job.id,
+    status: job.status,
+    started_at: job.started_at,
+    finished_at: job.finished_at,
+    options: {
+      jurisdiction: job.options.jurisdiction,
+      state: job.options.state,
+      urls: job.options.urls,
+      writeToNotion: job.options.writeToNotion,
+      replaceExisting: job.options.replaceExisting,
+    },
+    result: result
+      ? {
+          ok: result.ok,
+          run_id: result.run_id,
+          jurisdiction: result.jurisdiction,
+          state: result.state,
+          confidence: result.confidence,
+          stats: result.stats,
+          notion: result.notion,
+          supabase: result.supabase,
+          destination_proof: result.destination_proof,
+          base44: result.base44,
+          sources: result.sources,
+        }
+      : undefined,
+    error: job.error,
+  };
+}
+
+function startEnrichmentJob(options: EnrichmentOptions): { job: EnrichmentJob; existing: boolean } {
+  if (activeEnrichmentJob) {
+    if (enrichmentJobKey(activeEnrichmentJob.options) === enrichmentJobKey(options)) {
+      return { job: activeEnrichmentJob, existing: true };
+    }
+    throw new Error(
+      `Jurisdiction enrichment job ${activeEnrichmentJob.id} is already running for ${activeEnrichmentJob.options.jurisdiction}, ${activeEnrichmentJob.options.state}.`,
+    );
+  }
+
+  const job: EnrichmentJob = {
+    id: randomUUID().slice(0, 8),
+    status: "running",
+    started_at: new Date().toISOString(),
+    options,
+  };
+  enrichmentJobs.set(job.id, job);
+  activeEnrichmentJob = job;
+
+  void enrichZoningData(options)
+    .then((result) => {
+      job.result = result;
+      job.status = result.destination_proof?.verified === true ? "done" : "failed";
+      if (job.status === "failed") {
+        job.error = "Enrichment finished without verified Base44, Notion, and Supabase receipts.";
+      }
+      job.finished_at = new Date().toISOString();
+    })
+    .catch((error: unknown) => {
+      job.status = "failed";
+      job.error = error instanceof Error ? error.message : String(error);
+      job.finished_at = new Date().toISOString();
+    })
+    .finally(() => {
+      if (activeEnrichmentJob?.id === job.id) activeEnrichmentJob = null;
+    });
+
+  return { job, existing: false };
+}
+
 function text(payload: unknown) {
   return { content: [{ type: "text" as const, text: JSON.stringify(payload, null, 2) }] };
 }
@@ -337,8 +434,22 @@ const selectionShape = {
   offset: z.number().int().min(0).optional().describe("Skip the first N matching jurisdictions (for batching)")
 };
 
+const enrichmentShape = {
+  jurisdiction: z.string().min(1).describe("County, city, township, village, or other zoning jurisdiction name"),
+  state: z.string().min(2).describe("Two-letter state code or full state name"),
+  urls: z.array(z.union([
+    z.string().url(),
+    z.object({
+      url: z.string().url(),
+      authority_level: z.string().optional().describe("zoning_ordinance, tower_rules, planning, building, fee_schedule, gis, or other")
+    })
+  ])).min(1).max(20),
+  writeToNotion: z.boolean().optional().describe("Write the formatted enriched page to Notion (default true)"),
+  replaceExisting: z.boolean().optional().describe("Refresh an existing exact-match enriched page instead of making a duplicate (default true)")
+};
+
 function createServer(): McpServer {
-  const server = new McpServer({ name: "mcp-zoning-scraper", version: "2.3.0" });
+  const server = new McpServer({ name: "mcp-zoning-scraper", version: "2.6.0" });
 
   server.registerTool(
     "listZoningSources",
@@ -360,20 +471,8 @@ function createServer(): McpServer {
     "Enrichment-Zoning-Data-Tool",
     {
       description:
-        "Scrape one jurisdiction's official zoning, tower, planning, building, fee, and GIS URLs with Scrapfly first and Oxylabs as fallback. Extract the complete SiteHawk five-section zoning/permitting profile, upsert the canonical Base44 registry used by coordinate search, and create or refresh the enriched page under Zoning-Enrichment-Folder's correct state page.",
-      inputSchema: {
-        jurisdiction: z.string().min(1).describe("County, city, township, village, or other zoning jurisdiction name"),
-        state: z.string().min(2).describe("Two-letter state code or full state name"),
-        urls: z.array(z.union([
-          z.string().url(),
-          z.object({
-            url: z.string().url(),
-            authority_level: z.string().optional().describe("zoning_ordinance, tower_rules, planning, building, fee_schedule, gis, or other")
-          })
-        ])).min(1).max(20),
-        writeToNotion: z.boolean().optional().describe("Write the formatted enriched page to Notion (default true)"),
-        replaceExisting: z.boolean().optional().describe("Refresh an existing exact-match enriched page instead of making a duplicate (default true)")
-      }
+        "Scrape one jurisdiction's official zoning, tower, planning, building, fee, and GIS URLs. Extract the complete five-section profile, prove the canonical Base44 records and raw archive, create or refresh the exact Hacker Stackers Notion page, and upsert a returned Supabase telecom_ordinances row. Failure of any destination proof fails the tool.",
+      inputSchema: enrichmentShape
     },
     async (args) => {
       try {
@@ -382,6 +481,52 @@ function createServer(): McpServer {
         return fail(err);
       }
     }
+  );
+
+  server.registerTool(
+    "startJurisdictionEnrichment",
+    {
+      description:
+        "Start one guarded jurisdiction enrichment job and return immediately. Repeated starts for the same active jurisdiction return the existing job. A job is done only after verified Base44, Notion, and Supabase receipts; poll getJurisdictionEnrichmentStatus.",
+      inputSchema: enrichmentShape,
+    },
+    async (args) => {
+      try {
+        const { job, existing } = startEnrichmentJob({
+          ...args,
+          writeToNotion: args.writeToNotion !== false,
+          replaceExisting: args.replaceExisting !== false,
+        });
+        return text({
+          ok: true,
+          started: !existing,
+          existing,
+          ...enrichmentJobView(job),
+          hint: "Poll getJurisdictionEnrichmentStatus with this job_id. status=done guarantees triple-destination proof.",
+        });
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "getJurisdictionEnrichmentStatus",
+    {
+      description: "Return one guarded jurisdiction enrichment job. status=done is emitted only when Base44, Notion, and Supabase receipts are all verified.",
+      inputSchema: { job_id: z.string().min(1) },
+    },
+    async ({ job_id }) => {
+      try {
+        const job = enrichmentJobs.get(job_id);
+        if (!job) {
+          return text({ ok: false, error: `No jurisdiction enrichment job ${job_id} (jobs are in-memory and reset on redeploy).` });
+        }
+        return text({ ok: true, ...enrichmentJobView(job) });
+      } catch (err) {
+        return fail(err);
+      }
+    },
   );
 
   server.registerTool(
@@ -405,7 +550,7 @@ function createServer(): McpServer {
     "runEnrichmentQueue",
     {
       description:
-        "Process Pending URL rows from the Ordinances Inbox database, grouping multiple URLs for the same jurisdiction. Each result is written to Base44 and to the correct state page in Zoning-Enrichment-Folder, then the queue row is updated with status, provenance, field count, and destination link.",
+        "Process Pending or Failed Ordinances Inbox rows in guarded batches. Each jurisdiction must return verified Base44, Notion, and Supabase receipts before its row can advance. The batch freezes immediately on the first failed destination proof and retries Failed rows first.",
       inputSchema: {
         limit: z.number().int().min(1).max(25).optional().describe("Maximum jurisdictions to process (default 5)"),
         replaceExisting: z.boolean().optional().describe("Refresh exact-match enriched pages (default true)")
@@ -435,6 +580,9 @@ function createServer(): McpServer {
     },
     async (args) => {
       try {
+        if (args.dryRun !== true) {
+          return text({ ok: false, blocked: true, error: BROAD_SWEEP_BLOCK_REASON });
+        }
         const { background, ...options } = args;
         const wait = background === false;
         if (!wait) {
@@ -464,6 +612,9 @@ function createServer(): McpServer {
     },
     async ({ states, forceReset }) => {
       try {
+        if (broadSweepBlocked()) {
+          return text({ ok: false, blocked: true, error: BROAD_SWEEP_BLOCK_REASON, requested_states: states, force_reset_requested: forceReset === true });
+        }
         const storage = queueStorageStatus();
         if (storage.temporary_default) {
           return text({
@@ -527,6 +678,9 @@ function createServer(): McpServer {
     },
     async ({ batch, retryFailed, dryRun }) => {
       try {
+        if (broadSweepBlocked()) {
+          return text({ ok: false, blocked: true, started: false, error: BROAD_SWEEP_BLOCK_REASON, requested_batch: batch, retry_failed_requested: retryFailed === true });
+        }
         if (dryRun === true) {
           return text({
             ok: false,
@@ -780,13 +934,28 @@ function startHttpServer(port: number, authToken: string): void {
   });
 
   app.get("/health", (_request: Request, response: Response) => {
+    const destinationConfiguration = {
+      base44: Boolean(
+        process.env.BASE44_ZONING_INGEST?.trim()
+        && (process.env.BASE44_WEBHOOK_SECRET?.trim() || process.env.BASE44_API_KEY?.trim()),
+      ),
+      notion: Boolean(process.env.NOTION_KEY?.trim()),
+      supabase: Boolean(process.env.SUPABASE_SERVICE_ROLE_KEY?.trim() || process.env.SUPABASE_SECRET_KEY?.trim()),
+    };
     response.status(200).json({
       ok: true,
       service: "mcp-zoning-scraper",
-      version: "2.3.0",
+      version: "2.6.0",
+      browser_renderer: getBrowserRuntimeStatus(),
       queue_storage: queueStorageStatus(),
       queue_persistence_blocked: queuePersistenceBlocked,
+      triple_destination: {
+        configured: Object.values(destinationConfiguration).every(Boolean),
+        destinations: destinationConfiguration,
+        broad_sweep_blocked: broadSweepBlocked(),
+      },
       active_job: activeJob ? jobView(activeJob) : null,
+      active_enrichment_job: activeEnrichmentJob ? enrichmentJobView(activeEnrichmentJob) : null,
     });
   });
 
@@ -803,6 +972,20 @@ function startHttpServer(port: number, authToken: string): void {
       return;
     }
     response.status(200).json(jobView(job));
+  });
+
+  app.get("/enrichment-jobs/:id", (request: Request, response: Response) => {
+    if (!isAuthorized(request, authToken)) {
+      response.status(401).json({ error: "Unauthorized" });
+      return;
+    }
+    const id = String(request.params.id);
+    const job = id === "latest" ? [...enrichmentJobs.values()].at(-1) : enrichmentJobs.get(id);
+    if (!job) {
+      response.status(404).json({ error: "No such jurisdiction enrichment job" });
+      return;
+    }
+    response.status(200).json(enrichmentJobView(job));
   });
 
   app.post("/mcp", async (request: Request, response: Response) => {
@@ -838,6 +1021,9 @@ function startHttpServer(port: number, authToken: string): void {
 
   app.listen(port, "0.0.0.0", () => {
     console.log(`MCP Zoning Scraper listening on port ${port}`);
+    void warmBrowserRenderer().catch((error: unknown) => {
+      console.error("Playwright browser warmup failed:", error);
+    });
   });
 }
 

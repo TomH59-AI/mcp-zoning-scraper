@@ -12,6 +12,7 @@
 //   BASE44_WEBHOOK_SECRET  the app's WEBHOOK_SECRET  (falls back to BASE44_API_KEY)
 //   SCRAPFLY_API_KEY / SCRAPFLY_KEY, OXYLABS_USERNAME, OXYLABS_PASSWORD / OXYLABS_KEY
 import axios from "axios";
+import { renderWithPlaywright } from "./browserRenderer.js";
 import pdfParse from "pdf-parse/lib/pdf-parse.js";
 
 // ---------- types ----------
@@ -417,6 +418,10 @@ async function scrapeDirect(url: string): Promise<string> {
   return String(response.data ?? "");
 }
 
+async function scrapeWithPlaywright(url: string): Promise<string> {
+  return renderWithPlaywright(url);
+}
+
 function isJsHeavyCodeSite(url: string): boolean {
   return /municode|amlegal|generalcode|ecode360|codelibrary/i.test(url);
 }
@@ -427,8 +432,8 @@ function looksLikePlaceholder(text: string): boolean {
 
 export async function scrapeUrl(url: string): Promise<{ text: string; method: string }> {
   const attempts: Array<[string, () => Promise<string>]> = isJsHeavyCodeSite(url)
-    ? [["scrapfly", () => scrapeWithScrapfly(url)], ["oxylabs", () => scrapeWithOxyLabs(url)]]
-    : [["scrapfly", () => scrapeWithScrapfly(url)], ["direct", () => scrapeDirect(url)], ["oxylabs", () => scrapeWithOxyLabs(url)]];
+    ? [["scrapfly", () => scrapeWithScrapfly(url)], ["playwright", () => scrapeWithPlaywright(url)], ["oxylabs", () => scrapeWithOxyLabs(url)]]
+    : [["scrapfly", () => scrapeWithScrapfly(url)], ["direct", () => scrapeDirect(url)], ["playwright", () => scrapeWithPlaywright(url)], ["oxylabs", () => scrapeWithOxyLabs(url)]];
 
   const errors: string[] = [];
   for (const [method, fn] of attempts) {
