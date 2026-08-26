@@ -1,6 +1,6 @@
 {
   "name": "mcp-zoning-scraper",
-  "version": "2.3.0",
+  "version": "2.4.0",
   "type": "module",
   "scripts": {
     "build": "tsc",
@@ -14,7 +14,8 @@
     "@types/pdf-parse": "^1.1.5",
     "axios": "^1.6.0",
     "dotenv": "^16.3.1",
-    "pdf-parse": "^1.1.1"
+    "pdf-parse": "^1.1.1",
+    "playwright": "1.62.0"
   },
   "devDependencies": {
     "@types/express": "^5.0.0",
@@ -22,3 +23,4 @@
     "typescript": "^5.4.0"
   }
 }
+

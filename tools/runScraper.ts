@@ -1,17 +1,18 @@
-// runScraper — reads the Notion database "The United States Zoning URL"
+// runScraper â€” reads the Notion database "The United States Zoning URL"
 // (Jurisdiction | Authority Level | URL | State), scrapes every URL for a
 // jurisdiction, and POSTs the cleaned page text to the SiteHawk Base44 intake
 // function `zoningScraperIngest`, which LLM-extracts the complete five-section
 // SCIP profile and upserts Jurisdiction / TelecomOrdinance / JurisdictionRegistry
 // / JurisdictionResource.
 //
-// Env (Railway → Variables):
+// Env (Railway â†’ Variables):
 //   NOTION_KEY             Notion integration token (the DB must be shared with it)
 //   NOTION_ZONING_DB       database id, e.g. 356274bf71c180af8163d29dfbd263df
 //   BASE44_ZONING_INGEST   https://site-hawk-pro.base44.app/functions/zoningScraperIngest
 //   BASE44_WEBHOOK_SECRET  the app's WEBHOOK_SECRET  (falls back to BASE44_API_KEY)
 //   SCRAPFLY_API_KEY / SCRAPFLY_KEY, OXYLABS_USERNAME, OXYLABS_PASSWORD / OXYLABS_KEY
 import axios from "axios";
+import { renderWithPlaywright } from "./browserRenderer.js";
 import pdfParse from "pdf-parse/lib/pdf-parse.js";
 
 // ---------- types ----------
@@ -417,6 +418,10 @@ async function scrapeDirect(url: string): Promise<string> {
   return String(response.data ?? "");
 }
 
+async function scrapeWithPlaywright(url: string): Promise<string> {
+  return renderWithPlaywright(url);
+}
+
 function isJsHeavyCodeSite(url: string): boolean {
   return /municode|amlegal|generalcode|ecode360|codelibrary/i.test(url);
 }
@@ -427,8 +432,8 @@ function looksLikePlaceholder(text: string): boolean {
 
 export async function scrapeUrl(url: string): Promise<{ text: string; method: string }> {
   const attempts: Array<[string, () => Promise<string>]> = isJsHeavyCodeSite(url)
-    ? [["scrapfly", () => scrapeWithScrapfly(url)], ["oxylabs", () => scrapeWithOxyLabs(url)]]
-    : [["scrapfly", () => scrapeWithScrapfly(url)], ["direct", () => scrapeDirect(url)], ["oxylabs", () => scrapeWithOxyLabs(url)]];
+    ? [["scrapfly", () => scrapeWithScrapfly(url)], ["playwright", () => scrapeWithPlaywright(url)], ["oxylabs", () => scrapeWithOxyLabs(url)]]
+    : [["scrapfly", () => scrapeWithScrapfly(url)], ["direct", () => scrapeDirect(url)], ["playwright", () => scrapeWithPlaywright(url)], ["oxylabs", () => scrapeWithOxyLabs(url)]];
 
   const errors: string[] = [];
   for (const [method, fn] of attempts) {
@@ -734,7 +739,7 @@ export async function runScraper(opts: RunOptions = {}, onProgress?: (r: Jurisdi
     const polygon = opts.includePolygon === false ? null : await getJurisdictionPolygon(group.jurisdiction, group.state);
 
     const ingest: Base44IngestResult = opts.dryRun
-      ? { ok: false, skipped: true, status: 0, summary: "dry run — not sent" }
+      ? { ok: false, skipped: true, status: 0, summary: "dry run â€” not sent" }
       : await sendToBase44({
           run_id,
           jurisdiction: group.jurisdiction,
@@ -773,4 +778,5 @@ export async function runScraper(opts: RunOptions = {}, onProgress?: (r: Jurisdi
 
   return summary;
 }
+
 

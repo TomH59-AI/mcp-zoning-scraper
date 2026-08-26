@@ -14,6 +14,7 @@ import {
   type RunOptions,
   type RunSummary
 } from "../tools/runScraper.js";
+import { getBrowserRuntimeStatus, warmBrowserRenderer } from "../tools/browserRenderer.js";
 import {
   claimQueueBatch,
   finishQueueIfCurrent,
@@ -135,7 +136,7 @@ function startJob(options: RunOptions, queue?: Job["queue"], claimedJobId?: stri
       : result.ingest.ok
         ? "verified"
         : `FAILED ${result.ingest.status} ${result.ingest.error ?? ""}`;
-    console.log(`[job ${job.id}] ${done}/${total} ${result.jurisdiction}, ${result.state} → ingest ${outcome}`);
+    console.log(`[job ${job.id}] ${done}/${total} ${result.jurisdiction}, ${result.state} â†’ ingest ${outcome}`);
   })
     .then((summary) => {
       job.summary = { ...summary, results: summary.results.slice(-25) };
@@ -338,7 +339,7 @@ const selectionShape = {
 };
 
 function createServer(): McpServer {
-  const server = new McpServer({ name: "mcp-zoning-scraper", version: "2.3.0" });
+  const server = new McpServer({ name: "mcp-zoning-scraper", version: "2.4.0" });
 
   server.registerTool(
     "listZoningSources",
@@ -424,7 +425,7 @@ function createServer(): McpServer {
     "runScraper",
     {
       description:
-        "Scrape every Notion URL for the selected jurisdictions and push the page text to SiteHawk (Base44) zoningScraperIngest, which fills the SCIP template (Zoning Overview, Tower Specifics, Site Plan Overview, Building Permit Information) into Jurisdiction + TelecomOrdinance and records each URL in JurisdictionResource. Runs in the background by default — poll getScraperStatus with the returned job_id. Use dryRun to scrape without writing to Base44.",
+        "Scrape every Notion URL for the selected jurisdictions and push the page text to SiteHawk (Base44) zoningScraperIngest, which fills the SCIP template (Zoning Overview, Tower Specifics, Site Plan Overview, Building Permit Information) into Jurisdiction + TelecomOrdinance and records each URL in JurisdictionResource. Runs in the background by default â€” poll getScraperStatus with the returned job_id. Use dryRun to scrape without writing to Base44.",
       inputSchema: {
         ...selectionShape,
         dryRun: z.boolean().optional().describe("Scrape only; do not send anything to Base44"),
@@ -456,7 +457,7 @@ function createServer(): McpServer {
     "startZoningSweep",
     {
       description:
-        "Begin (or restart) a multi-state sweep of the Notion zoning library. Sets the durable cursor; does not scrape anything by itself — call runNextBatch to do the work. Use this once, then let a scheduled task call runNextBatch repeatedly.",
+        "Begin (or restart) a multi-state sweep of the Notion zoning library. Sets the durable cursor; does not scrape anything by itself â€” call runNextBatch to do the work. Use this once, then let a scheduled task call runNextBatch repeatedly.",
       inputSchema: {
         states: z.array(z.string()).min(1).describe("States in the order to sweep, e.g. ['FL','NC','GA']"),
         forceReset: z.literal(true).optional().describe("Required to abandon a latched failed sweep and create a new queue generation."),
@@ -551,7 +552,7 @@ function createServer(): McpServer {
           return text({
             ok: true,
             skipped: "job_in_flight",
-            message: `Batch ${activeJob.id} is still running (${activeJob.done}/${activeJob.total}) — nothing started.`,
+            message: `Batch ${activeJob.id} is still running (${activeJob.done}/${activeJob.total}) â€” nothing started.`,
             job_id: activeJob.id
           });
         }
@@ -571,7 +572,7 @@ function createServer(): McpServer {
           const requestedSize = batch ?? 3;
           const q = loadQueue();
           if (!q.states.length) {
-            return text({ ok: false, error: "No sweep configured — call startZoningSweep with the states first." });
+            return text({ ok: false, error: "No sweep configured â€” call startZoningSweep with the states first." });
           }
           if (!q.started_at) {
             return text({ ok: false, blocked: true, error: "The configured queue has no generation identifier; reset it before running." });
@@ -585,7 +586,7 @@ function createServer(): McpServer {
               skipped: stale ? "stale_job_in_flight" : "job_in_flight_other_process",
               message: stale
                 ? "A stale persisted batch claim was found. It will not be reused or bypassed; an operator must explicitly reset the sweep."
-                : "Another Railway process owns the current batch — nothing started.",
+                : "Another Railway process owns the current batch â€” nothing started.",
               in_flight: q.in_flight,
               stale,
             });
@@ -665,7 +666,7 @@ function createServer(): McpServer {
 
           if (plan.done) {
             const finished = finishQueueIfCurrent(originalCursor, advanced);
-            return text({ ok: true, done: true, queue: finished, message: "Sweep complete — every state has been scraped." });
+            return text({ ok: true, done: true, queue: finished, message: "Sweep complete â€” every state has been scraped." });
           }
 
           const jurisdictions = plan.jurisdictions ?? [];
@@ -783,14 +784,15 @@ function startHttpServer(port: number, authToken: string): void {
     response.status(200).json({
       ok: true,
       service: "mcp-zoning-scraper",
-      version: "2.3.0",
+      version: "2.4.0",
+      browser_renderer: getBrowserRuntimeStatus(),
       queue_storage: queueStorageStatus(),
       queue_persistence_blocked: queuePersistenceBlocked,
       active_job: activeJob ? jobView(activeJob) : null,
     });
   });
 
-  // Same bearer token as /mcp — handy for watching a long run from a browser/curl.
+  // Same bearer token as /mcp â€” handy for watching a long run from a browser/curl.
   app.get("/jobs/:id", (request: Request, response: Response) => {
     if (!isAuthorized(request, authToken)) {
       response.status(401).json({ error: "Unauthorized" });
@@ -838,6 +840,9 @@ function startHttpServer(port: number, authToken: string): void {
 
   app.listen(port, "0.0.0.0", () => {
     console.log(`MCP Zoning Scraper listening on port ${port}`);
+    void warmBrowserRenderer().catch((error: unknown) => {
+      console.error("Playwright browser warmup failed:", error);
+    });
   });
 }
 
@@ -858,3 +863,4 @@ main().catch((error: unknown) => {
   console.error("MCP server failed to start:", error);
   process.exit(1);
 });
+

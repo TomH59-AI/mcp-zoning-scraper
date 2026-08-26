@@ -4,7 +4,7 @@ import { scrapeUrl, sendToBase44, toStateCode } from "./runScraper.js";
 const NOTION_API_VERSION = "2026-03-11";
 const DEFAULT_ROOT_PAGE_ID = "fef2e8a4-6958-4bbc-bd9e-a564a26f76c9";
 const DEFAULT_INBOX_DATA_SOURCE_ID = "5ecc4308-9150-42c6-8b38-d4a7e28539bf";
-const NOT_FOUND = "Not found — requires direct contact";
+const NOT_FOUND = "Not found â€” requires direct contact";
 
 export type EnrichmentSourceInput = {
   url: string;
@@ -155,7 +155,7 @@ function formattedDistance(value: unknown, unit: unknown): string | null {
   const number = Number(value);
   if (!Number.isFinite(number)) return null;
   if (unit === "pct") return `${number}% of tower height`;
-  if (unit === "multiple") return `${number} × tower height`;
+  if (unit === "multiple") return `${number} Ã— tower height`;
   return `${number} ft`;
 }
 
@@ -349,7 +349,7 @@ function formatProfileBlocks(jurisdiction: string, state: string, profile: Recor
       object: "block",
       type: "callout",
       callout: {
-        icon: { type: "emoji", emoji: "✅" },
+        icon: { type: "emoji", emoji: "âœ…" },
         color: "green_background",
         rich_text: [textRun("SiteHawk Enriched Entry. Values are sourced from the listed documents; unavailable fields are marked for direct contact.")],
       },
@@ -430,7 +430,7 @@ function formatProfileBlocks(jurisdiction: string, state: string, profile: Recor
     type: "paragraph",
     paragraph: {
       rich_text: [{
-        ...textRun(`Researched and verified — ${verified}. ${stats?.scip_fields_filled ?? "Unknown"} fields populated; ${stats?.fields_missing ?? "unknown"} marked Not found / requires direct contact.`),
+        ...textRun(`Researched and verified â€” ${verified}. ${stats?.scip_fields_filled ?? "Unknown"} fields populated; ${stats?.fields_missing ?? "unknown"} marked Not found / requires direct contact.`),
         annotations: { italic: true },
       }],
     },
@@ -468,7 +468,7 @@ async function replacePageChildren(pageId: string, children: Array<Record<string
 
 async function writeEnrichedPage(jurisdiction: string, state: string, profile: Record<string, any>, citations: Array<Record<string, any>>, stats: Record<string, any>, replaceExisting: boolean) {
   const destination = await resolveStatePage(state);
-  const title = `${toStateCode(state)} - ${jurisdiction} Telecom Ordinance — SiteHawk Enriched`;
+  const title = `${toStateCode(state)} - ${jurisdiction} Telecom Ordinance â€” SiteHawk Enriched`;
   const children = formatProfileBlocks(jurisdiction, toStateCode(state), profile, citations, stats);
   const existingId = await findPageUnderParent(title, destination.id);
   if (existingId) {
@@ -477,7 +477,7 @@ async function writeEnrichedPage(jurisdiction: string, state: string, profile: R
     }
     await notionApi(`/pages/${existingId}`, {
       method: "PATCH",
-      body: JSON.stringify({ icon: { type: "emoji", emoji: "📡" } }),
+      body: JSON.stringify({ icon: { type: "emoji", emoji: "ðŸ“¡" } }),
     });
     await replacePageChildren(existingId, children);
     return { page_id: existingId, page_url: notionPageUrl(existingId), state_page_url: destination.url, action: "updated" };
@@ -486,7 +486,7 @@ async function writeEnrichedPage(jurisdiction: string, state: string, profile: R
     method: "POST",
     body: JSON.stringify({
       parent: { type: "page_id", page_id: destination.id },
-      icon: { type: "emoji", emoji: "📡" },
+      icon: { type: "emoji", emoji: "ðŸ“¡" },
       properties: { title: { type: "title", title: [{ type: "text", text: { content: title } }] } },
       children,
     }),
@@ -512,7 +512,7 @@ function queueResultProperties(result: Record<string, any>, methods: string[]) {
   const height = Number.parseFloat(String(tower.maximum_tower_height || "").match(/\d+(?:\.\d+)?/)?.[0] || "");
   const collocations = Number.parseFloat(String(tower.required_collocations || "").match(/\d+(?:\.\d+)?/)?.[0] || "");
   const stealthText = String(tower.stealth_required || "");
-  const stealth = /^yes\b/i.test(stealthText) ? "True" : /^no\b/i.test(stealthText) ? "False" : /conditional|where|required when/i.test(stealthText) ? "Conditional" : "Not found — requires direct contact";
+  const stealth = /^yes\b/i.test(stealthText) ? "True" : /^no\b/i.test(stealthText) ? "False" : /conditional|where|required when/i.test(stealthText) ? "Conditional" : "Not found â€” requires direct contact";
   const method = [...new Set(methods)].length === 1 ? methods[0] : "mixed";
   return {
     "Enrichment Status": { type: "select", select: { name: result.confidence === "high" ? "Enriched" : "Needs Review" } },
@@ -520,7 +520,7 @@ function queueResultProperties(result: Record<string, any>, methods: string[]) {
     "Destination State Page": { type: "url", url: result.notion?.state_page_url || null },
     "Last Enriched": { type: "date", date: { start: new Date().toISOString() } },
     "Last Error": richTextProperty(""),
-    "Scrape Method": { type: "select", select: { name: ["scrapfly", "oxylabs", "direct"].includes(method) ? method : "mixed" } },
+    "Scrape Method": { type: "select", select: { name: ["scrapfly", "oxylabs", "direct", "playwright"].includes(method) ? method : "mixed" } },
     "Source Confidence": { type: "select", select: { name: ["high", "medium", "low"].includes(result.confidence) ? result.confidence : "low" } },
     "Fields Populated": { type: "number", number: result.stats?.scip_fields_filled ?? null },
     "Needs Review?": { type: "checkbox", checkbox: result.confidence !== "high" },
@@ -616,8 +616,8 @@ export async function enrichZoningData(options: EnrichmentOptions) {
 }
 
 function parseQueueIdentity(title: string, explicitState: string | null) {
-  const cleaned = title.replace(/^RAW\s*[—-]\s*/i, "").replace(/\s*[—-]\s*\d{4}-\d{2}-\d{2}\s*$/i, "").trim();
-  const match = cleaned.match(/^([A-Z]{2})\s*[—-]\s*(.+)$/i);
+  const cleaned = title.replace(/^RAW\s*[â€”-]\s*/i, "").replace(/\s*[â€”-]\s*\d{4}-\d{2}-\d{2}\s*$/i, "").trim();
+  const match = cleaned.match(/^([A-Z]{2})\s*[â€”-]\s*(.+)$/i);
   const state = toStateCode(explicitState || match?.[1] || "");
   const jurisdiction = (match?.[2] || cleaned).trim();
   return { state, jurisdiction };
@@ -679,3 +679,4 @@ export async function runEnrichmentQueue(limit = 5, replaceExisting = true) {
   }
   return { ok: true, queued_rows: items.length, selected_jurisdictions: selected.length, results };
 }
+
