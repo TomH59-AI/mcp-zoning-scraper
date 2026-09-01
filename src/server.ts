@@ -9,12 +9,17 @@ import path from "node:path";
 import { z } from "zod";
 import {
   listZoningSources,
+  renderZoningUrl,
   runScraper,
   type JurisdictionResult,
   type RunOptions,
   type RunSummary
 } from "../tools/runScraper.js";
-import { getBrowserRuntimeStatus, warmBrowserRenderer } from "../tools/browserRenderer.js";
+import {
+  getBrowserRuntimeStatus,
+  getOxylabsHeadlessRuntimeStatus,
+  warmBrowserRenderer,
+} from "../tools/browserRenderer.js";
 import {
   claimQueueBatch,
   finishQueueIfCurrent,
@@ -449,7 +454,7 @@ const enrichmentShape = {
 };
 
 function createServer(): McpServer {
-  const server = new McpServer({ name: "mcp-zoning-scraper", version: "2.6.0" });
+  const server = new McpServer({ name: "mcp-zoning-scraper", version: "2.7.0" });
 
   server.registerTool(
     "listZoningSources",
@@ -465,6 +470,25 @@ function createServer(): McpServer {
         return fail(err);
       }
     }
+  );
+
+  server.registerTool(
+    "renderZoningUrl",
+    {
+      description:
+        "Read one public zoning or ordinance URL and return bounded, cleaned source text without writing to Base44, Notion, Supabase, or the sweep queue. Use oxylabs_headless when a live remote browser session is required.",
+      inputSchema: {
+        url: z.string().url().max(2_048).describe("One public http(s) zoning or ordinance page"),
+        engine: z.enum(["auto", "oxylabs_headless"]).optional().describe("Rendering engine; default auto"),
+      },
+    },
+    async ({ url, engine }) => {
+      try {
+        return text({ ok: true, ...(await renderZoningUrl(url, engine ?? "auto")) });
+      } catch (err) {
+        return fail(err);
+      }
+    },
   );
 
   server.registerTool(
@@ -945,8 +969,9 @@ function startHttpServer(port: number, authToken: string): void {
     response.status(200).json({
       ok: true,
       service: "mcp-zoning-scraper",
-      version: "2.6.0",
+      version: "2.7.0",
       browser_renderer: getBrowserRuntimeStatus(),
+      oxylabs_headless: getOxylabsHeadlessRuntimeStatus(),
       queue_storage: queueStorageStatus(),
       queue_persistence_blocked: queuePersistenceBlocked,
       triple_destination: {

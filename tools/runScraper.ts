@@ -12,7 +12,7 @@
 //   BASE44_WEBHOOK_SECRET  the app's WEBHOOK_SECRET  (falls back to BASE44_API_KEY)
 //   SCRAPFLY_API_KEY / SCRAPFLY_KEY, OXYLABS_USERNAME, OXYLABS_PASSWORD / OXYLABS_KEY
 import axios from "axios";
-import { renderWithPlaywright } from "./browserRenderer.js";
+import { renderWithOxylabsHeadless, renderWithPlaywright } from "./browserRenderer.js";
 import pdfParse from "pdf-parse/lib/pdf-parse.js";
 
 // ---------- types ----------
@@ -369,17 +369,7 @@ function selectRelevantSourceText(text: string, limit = MAX_TEXT_CHARS): string 
 }
 
 async function scrapeWithOxyLabs(url: string): Promise<string> {
-  const username = optionalEnv("OXYLABS_USERNAME");
-  const password = optionalEnv("OXYLABS_PASSWORD", "OXYLABS_KEY");
-  if (!username || !password) throw new Error("OxyLabs credentials not configured");
-  const response = await axios.post<{ results?: Array<{ content?: string }> }>(
-    "https://realtime.oxylabs.io/v1/queries",
-    { source: "universal", url, render: "html", geo_location: "United States", user_agent_type: "desktop" },
-    { auth: { username, password }, timeout: 90000 }
-  );
-  const content = response.data.results?.[0]?.content;
-  if (!content) throw new Error("Oxylabs returned no content");
-  return content;
+  return (await renderWithOxylabsHeadless(url)).html;
 }
 
 async function scrapeWithScrapfly(url: string): Promise<string> {
@@ -432,8 +422,8 @@ function looksLikePlaceholder(text: string): boolean {
 
 export async function scrapeUrl(url: string): Promise<{ text: string; method: string }> {
   const attempts: Array<[string, () => Promise<string>]> = isJsHeavyCodeSite(url)
-    ? [["scrapfly", () => scrapeWithScrapfly(url)], ["playwright", () => scrapeWithPlaywright(url)], ["oxylabs", () => scrapeWithOxyLabs(url)]]
-    : [["scrapfly", () => scrapeWithScrapfly(url)], ["direct", () => scrapeDirect(url)], ["playwright", () => scrapeWithPlaywright(url)], ["oxylabs", () => scrapeWithOxyLabs(url)]];
+    ? [["scrapfly", () => scrapeWithScrapfly(url)], ["playwright", () => scrapeWithPlaywright(url)], ["oxylabs_headless", () => scrapeWithOxyLabs(url)]]
+    : [["scrapfly", () => scrapeWithScrapfly(url)], ["direct", () => scrapeDirect(url)], ["playwright", () => scrapeWithPlaywright(url)], ["oxylabs_headless", () => scrapeWithOxyLabs(url)]];
 
   const errors: string[] = [];
   for (const [method, fn] of attempts) {
@@ -450,6 +440,54 @@ export async function scrapeUrl(url: string): Promise<{ text: string; method: st
     }
   }
   throw new Error(errors.join(" | "));
+}
+
+export async function renderZoningUrl(
+  url: string,
+  engine: "auto" | "oxylabs_headless" = "auto",
+): Promise<{
+  url: string;
+  final_url: string;
+  title: string | null;
+  status_code: number | null;
+  method: string;
+  text: string;
+  chars: number;
+  source_chars: number;
+  truncated: boolean;
+}> {
+  if (engine === "auto") {
+    const result = await scrapeUrl(url);
+    return {
+      url,
+      final_url: url,
+      title: null,
+      status_code: null,
+      method: result.method,
+      text: result.text,
+      chars: result.text.length,
+      source_chars: result.text.length,
+      truncated: result.text.length >= MAX_TEXT_CHARS,
+    };
+  }
+
+  const rendered = await renderWithOxylabsHeadless(url);
+  const cleaned = cleanHtml(rendered.html);
+  if (looksLikePlaceholder(cleaned)) {
+    throw new Error(`oxylabs_headless: thin/placeholder page (${cleaned.length} chars)`);
+  }
+  const selected = selectRelevantSourceText(cleaned);
+  return {
+    url,
+    final_url: rendered.finalUrl,
+    title: rendered.title || null,
+    status_code: rendered.statusCode,
+    method: "oxylabs_headless",
+    text: selected,
+    chars: selected.length,
+    source_chars: cleaned.length,
+    truncated: selected.length < cleaned.length,
+  };
 }
 
 async function scrapeGroup(group: JurisdictionGroup): Promise<ScrapedSource[]> {

@@ -11,6 +11,25 @@ export interface BrowserRuntimeStatus {
   error?: string;
 }
 
+export interface OxylabsHeadlessRuntimeStatus {
+  configured: boolean;
+  engine: "playwright-chromium";
+  transport: "oxylabs-cdp";
+  endpoint: "ubc.oxylabs.io";
+}
+
+export interface BrowserRenderResult {
+  html: string;
+  title: string;
+  finalUrl: string;
+  statusCode: number | null;
+}
+
+export type CdpConnector = (
+  endpointUrl: string,
+  options?: { timeout?: number },
+) => Promise<Browser>;
+
 const enabled = !/^(0|false|off|no)$/i.test(process.env.PLAYWRIGHT_ENABLED?.trim() || "true");
 let browserPromise: Promise<Browser> | null = null;
 let state: BrowserRuntimeState = enabled ? "not_started" : "disabled";
@@ -31,10 +50,16 @@ function isPrivateIpv4(hostname: string): boolean {
 
 function isPrivateIpv6(hostname: string): boolean {
   const normalized = hostname.toLowerCase().replace(/^\[|\]$/g, "");
-  return normalized === "::" || normalized === "::1" || normalized.startsWith("fc") || normalized.startsWith("fd") || /^fe[89ab]/.test(normalized);
+  return normalized === "::"
+    || normalized === "::1"
+    || normalized.startsWith("::ffff:")
+    || normalized.startsWith("fc")
+    || normalized.startsWith("fd")
+    || /^fe[89ab]/.test(normalized)
+    || normalized.startsWith("ff");
 }
 
-function isBlockedTarget(rawUrl: string): boolean {
+export function isBlockedTarget(rawUrl: string): boolean {
   let parsed: URL;
   try {
     parsed = new URL(rawUrl);
@@ -46,6 +71,61 @@ function isBlockedTarget(rawUrl: string): boolean {
   if (!hostname || hostname === "localhost" || hostname.endsWith(".localhost") || hostname.endsWith(".local") || hostname.endsWith(".internal")) return true;
   const ipVersion = isIP(hostname);
   return (ipVersion === 4 && isPrivateIpv4(hostname)) || (ipVersion === 6 && isPrivateIpv6(hostname));
+}
+
+function optionalEnv(...names: string[]): string | null {
+  for (const name of names) {
+    const value = process.env[name]?.trim();
+    if (value) return value;
+  }
+  return null;
+}
+
+function oxylabsCredentials(): { username: string; password: string } {
+  const username = optionalEnv("OXYLABS_HEADLESS_USERNAME", "OXYLABS_USERNAME");
+  const password = optionalEnv("OXYLABS_HEADLESS_PASSWORD", "OXYLABS_PASSWORD", "OXYLABS_KEY");
+  if (!username || !password) {
+    throw new Error("Oxylabs Headless Browser credentials are not configured on Railway");
+  }
+  return { username, password };
+}
+
+function authenticatedOxylabsEndpoint(username: string, password: string): string {
+  const configured = optionalEnv("OXYLABS_HEADLESS_ENDPOINT") || "wss://ubc.oxylabs.io";
+  const raw = /^wss:\/\//i.test(configured) ? configured : `wss://${configured}`;
+  let endpoint: URL;
+  try {
+    endpoint = new URL(raw);
+  } catch {
+    throw new Error("OXYLABS_HEADLESS_ENDPOINT is not a valid WSS endpoint");
+  }
+  if (
+    endpoint.protocol !== "wss:"
+    || endpoint.hostname.toLowerCase() !== "ubc.oxylabs.io"
+    || endpoint.port
+    || endpoint.pathname !== "/"
+    || endpoint.search
+    || endpoint.hash
+  ) {
+    throw new Error("OXYLABS_HEADLESS_ENDPOINT must be wss://ubc.oxylabs.io");
+  }
+  endpoint.username = username;
+  endpoint.password = password;
+  return endpoint.toString();
+}
+
+export function sanitizeOxylabsConnectionError(error: unknown): Error {
+  const message = error instanceof Error ? error.message : String(error);
+  if (/timed?\s*out|timeout/i.test(message)) {
+    return new Error("Oxylabs Headless Browser connection timed out");
+  }
+  if (/\b401\b|unauthori[sz]ed/i.test(message)) {
+    return new Error("Oxylabs Headless Browser authentication was rejected (401)");
+  }
+  if (/\b403\b|forbidden/i.test(message)) {
+    return new Error("Oxylabs Headless Browser access was rejected (403)");
+  }
+  return new Error("Oxylabs Headless Browser connection failed");
 }
 
 async function getBrowser(): Promise<Browser> {
@@ -81,6 +161,18 @@ export function getBrowserRuntimeStatus(): BrowserRuntimeStatus {
     engine: "playwright-chromium",
     transport: "local",
     ...(lastError ? { error: lastError } : {}),
+  };
+}
+
+export function getOxylabsHeadlessRuntimeStatus(): OxylabsHeadlessRuntimeStatus {
+  return {
+    configured: Boolean(
+      optionalEnv("OXYLABS_HEADLESS_USERNAME", "OXYLABS_USERNAME")
+      && optionalEnv("OXYLABS_HEADLESS_PASSWORD", "OXYLABS_PASSWORD", "OXYLABS_KEY"),
+    ),
+    engine: "playwright-chromium",
+    transport: "oxylabs-cdp",
+    endpoint: "ubc.oxylabs.io",
   };
 }
 
@@ -120,5 +212,58 @@ export async function renderWithPlaywright(url: string): Promise<string> {
     return await page.content();
   } finally {
     await context.close();
+  }
+}
+
+export async function renderWithOxylabsHeadless(
+  url: string,
+  connectOverCDP: CdpConnector = (endpointUrl, options) => chromium.connectOverCDP(endpointUrl, options),
+): Promise<BrowserRenderResult> {
+  if (isBlockedTarget(url)) {
+    throw new Error("Oxylabs Headless Browser refused a non-public or invalid HTTP target");
+  }
+
+  const { username, password } = oxylabsCredentials();
+  const endpointUrl = authenticatedOxylabsEndpoint(username, password);
+  let browser: Browser;
+  try {
+    browser = await connectOverCDP(endpointUrl, { timeout: 20_000 });
+  } catch (error) {
+    throw sanitizeOxylabsConnectionError(error);
+  }
+
+  try {
+    const page = await browser.newPage({
+      ignoreHTTPSErrors: false,
+      javaScriptEnabled: true,
+      locale: "en-US",
+      serviceWorkers: "block",
+    });
+    try {
+      await page.route("**/*", async (route) => {
+        const request = route.request();
+        if (isBlockedTarget(request.url())) {
+          await route.abort("blockedbyclient");
+          return;
+        }
+        if (["image", "media", "font"].includes(request.resourceType())) {
+          await route.abort("blockedbyclient");
+          return;
+        }
+        await route.continue();
+      });
+      const response = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45_000 });
+      await page.waitForLoadState("networkidle", { timeout: 10_000 }).catch(() => undefined);
+      return {
+        html: await page.content(),
+        title: await page.title(),
+        finalUrl: page.url(),
+        statusCode: response?.status() ?? null,
+      };
+    } finally {
+      await page.close().catch(() => undefined);
+    }
+  } finally {
+    await browser.close().catch(() => undefined);
   }
 }
