@@ -23,6 +23,7 @@ export interface BrowserRenderResult {
   title: string;
   finalUrl: string;
   statusCode: number | null;
+  links: Array<{ url: string; title: string }>;
 }
 
 export type CdpConnector = (
@@ -254,11 +255,22 @@ export async function renderWithOxylabsHeadless(
       });
       const response = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45_000 });
       await page.waitForLoadState("networkidle", { timeout: 10_000 }).catch(() => undefined);
+      const rawLinks = await page.locator("a[href]").evaluateAll((anchors) => anchors.slice(0, 200).map((anchor) => ({
+        url: (anchor as HTMLAnchorElement).href,
+        title: (anchor.textContent || "").replace(/\s+/g, " ").trim(),
+      })));
+      const seenLinks = new Set<string>();
+      const links = rawLinks.filter((link) => {
+        if (!/^https?:\/\//i.test(link.url) || seenLinks.has(link.url)) return false;
+        seenLinks.add(link.url);
+        return true;
+      }).slice(0, 100);
       return {
         html: await page.content(),
         title: await page.title(),
         finalUrl: page.url(),
         statusCode: response?.status() ?? null,
+        links,
       };
     } finally {
       await page.close().catch(() => undefined);

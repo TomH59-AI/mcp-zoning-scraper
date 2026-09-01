@@ -75,6 +75,12 @@ test("Oxylabs renderer encodes credentials, returns page evidence, and closes th
         content: async () => "<html><body>Zoning ordinance evidence</body></html>",
         title: async () => "Official Zoning",
         url: () => "https://example.com/zoning/final",
+        locator: () => ({
+          evaluateAll: async () => [
+            { url: "https://example.com/ordinance", title: "Ordinance" },
+            { url: "mailto:test@example.com", title: "Email" },
+          ],
+        }),
         close: async () => { pageClosed = true; },
       }),
       close: async () => { browserClosed = true; },
@@ -99,6 +105,7 @@ test("Oxylabs renderer encodes credentials, returns page evidence, and closes th
       title: "Official Zoning",
       finalUrl: "https://example.com/zoning/final",
       statusCode: 200,
+      links: [{ url: "https://example.com/ordinance", title: "Ordinance" }],
     });
     assert.equal(pageClosed, true);
     assert.equal(browserClosed, true);

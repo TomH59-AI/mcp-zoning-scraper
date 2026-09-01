@@ -456,6 +456,7 @@ export async function renderZoningUrl(
   source_chars: number;
   truncated: boolean;
   low_signal: boolean;
+  links: Array<{ url: string; title: string }>;
 }> {
   if (engine === "auto") {
     const result = await scrapeUrl(url);
@@ -470,6 +471,7 @@ export async function renderZoningUrl(
       source_chars: result.text.length,
       truncated: result.text.length >= MAX_TEXT_CHARS,
       low_signal: looksLikePlaceholder(result.text),
+      links: [],
     };
   }
 
@@ -488,6 +490,7 @@ export async function renderZoningUrl(
     source_chars: cleaned.length,
     truncated: selected.length < cleaned.length,
     low_signal: looksLikePlaceholder(cleaned),
+    links: rendered.links,
   };
 }
 
