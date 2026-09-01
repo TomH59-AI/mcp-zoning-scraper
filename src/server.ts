@@ -454,7 +454,7 @@ const enrichmentShape = {
 };
 
 function createServer(): McpServer {
-  const server = new McpServer({ name: "mcp-zoning-scraper", version: "2.7.0" });
+  const server = new McpServer({ name: "mcp-zoning-scraper", version: "2.7.1" });
 
   server.registerTool(
     "listZoningSources",
@@ -969,7 +969,7 @@ function startHttpServer(port: number, authToken: string): void {
     response.status(200).json({
       ok: true,
       service: "mcp-zoning-scraper",
-      version: "2.7.0",
+      version: "2.7.1",
       browser_renderer: getBrowserRuntimeStatus(),
       oxylabs_headless: getOxylabsHeadlessRuntimeStatus(),
       queue_storage: queueStorageStatus(),

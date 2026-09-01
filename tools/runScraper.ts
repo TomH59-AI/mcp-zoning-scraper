@@ -455,6 +455,7 @@ export async function renderZoningUrl(
   chars: number;
   source_chars: number;
   truncated: boolean;
+  low_signal: boolean;
 }> {
   if (engine === "auto") {
     const result = await scrapeUrl(url);
@@ -468,14 +469,13 @@ export async function renderZoningUrl(
       chars: result.text.length,
       source_chars: result.text.length,
       truncated: result.text.length >= MAX_TEXT_CHARS,
+      low_signal: looksLikePlaceholder(result.text),
     };
   }
 
   const rendered = await renderWithOxylabsHeadless(url);
   const cleaned = cleanHtml(rendered.html);
-  if (looksLikePlaceholder(cleaned)) {
-    throw new Error(`oxylabs_headless: thin/placeholder page (${cleaned.length} chars)`);
-  }
+  if (!cleaned) throw new Error("oxylabs_headless: rendered page contained no readable text");
   const selected = selectRelevantSourceText(cleaned);
   return {
     url,
@@ -487,6 +487,7 @@ export async function renderZoningUrl(
     chars: selected.length,
     source_chars: cleaned.length,
     truncated: selected.length < cleaned.length,
+    low_signal: looksLikePlaceholder(cleaned),
   };
 }
 
