@@ -7,6 +7,13 @@ const emit = (event, data={}) => console.log(JSON.stringify({canary:"accomack-20
 let phase="preflight", jobId=null;
 const guard=setTimeout(()=>{emit("timeout",{phase,job_id:jobId});process.exit(1)},720000);
 const client=new Client({name:"sitehawk-accomack-verification",version:"1.0.0"});
+function safeMessage(error) {
+ let message=String(error?.message||error||'');
+ for(const name of ['MCP_AUTH_TOKEN','NOTION_KEY','BASE44_API_KEY','BASE44_WEBHOOK_SECRET','SUPABASE_SERVICE_ROLE_KEY','SCRAPFLY_API_KEY','SCRAPFLY_KEY','OXYLABS_PASSWORD']) {
+  const value=process.env[name]; if(value)message=message.split(value).join('[REDACTED]');
+ }
+ return message.slice(0,1000);
+}
 function failureCode(error) {
  const s=String(error?.message||error);
  if(/external zoning ingest is frozen/i.test(s))return "BASE44_EXTERNAL_INGEST_FROZEN";
@@ -28,8 +35,21 @@ async function call(name,args) {
  return p;
 }
 try {
- if(Date.now()>Date.parse("2026-09-18T16:15:00Z"))throw Error("Canary launch window expired");
+ if(Date.now()>Date.parse("2026-09-18T17:00:00Z"))throw Error("Canary launch window expired");
  if(!process.env.MCP_AUTH_TOKEN)throw Error("Missing existing service authentication");
+ const inspectId=process.argv[process.argv.indexOf('--inspect-job')+1];
+ if(process.argv.includes('--inspect-job')) {
+  if(!/^[a-f0-9]{8}$/.test(inspectId||''))throw Error('Invalid inspection job ID');
+  const r=await fetch(origin+'/enrichment-jobs/'+inspectId,{headers:{Authorization:'Bearer '+process.env.MCP_AUTH_TOKEN},signal:AbortSignal.timeout(15000)});
+  const p=await r.json();
+  emit('job_inspected',{http_status:r.status,job_id:p.job_id,status:p.status,error:safeMessage(p.error),run_id:p.result?.run_id,destination_proof:p.result?.destination_proof});
+  for(const path of ['/users/me','/blocks/fef2e8a4-6958-4bbc-bd9e-a564a26f76c9/children?page_size=1']) {
+   const nr=await fetch('https://api.notion.com/v1'+path,{headers:{Authorization:'Bearer '+process.env.NOTION_KEY,'Notion-Version':'2025-09-03'},signal:AbortSignal.timeout(15000)});
+   const np=await nr.json();
+   emit('notion_access',{scope:path.startsWith('/users')?'integration_identity':'enrichment_root',http_status:nr.status,code:np.code,integration_name:np.name,error:safeMessage(np.message)});
+  }
+  clearTimeout(guard);process.exit(0);
+ }
  const h=await fetch(origin+"/health",{signal:AbortSignal.timeout(15000)}).then(r=>r.json());
  if(!h.ok||h.active_job||h.active_enrichment_job||h.triple_destination?.broad_sweep_blocked!==true||h.triple_destination?.configured!==true)throw Error("Preflight not clear");
  emit("preflight_passed",{broad_sweep_blocked:true,active_jobs:0});
@@ -59,7 +79,7 @@ try {
  }
  if(phase!=="complete")throw Error("Job polling deadline exceeded");
 }catch(error){
- emit("failed",{phase,job_id:jobId,code:failureCode(error)});
+ emit("failed",{phase,job_id:jobId,code:failureCode(error),error:safeMessage(error)});
  process.exitCode=1;
 }finally{
  clearTimeout(guard);
