@@ -2,9 +2,37 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   selectGroups,
+  looksLikePlaceholder,
+  scrapeMunicodeSection,
   verifyBase44IngestResponse,
   type JurisdictionGroup,
 } from "./runScraper.js";
+
+test('rejects the long Municode error shell from the Accomack live test', () => {
+  const shell = 'Municode Library. Initializing application... The requested content cannot be found or you are not authorized to view it. ' + 'Download publication PDF. '.repeat(25);
+  assert.equal(looksLikePlaceholder(shell), true);
+  assert.equal(looksLikePlaceholder('Tower facilities shall satisfy the minimum zoning district setback requirements. '.repeat(10)), false);
+});
+
+test('Municode adapter resolves exact client, edition and section and retains full content', async () => {
+  const seen: string[] = [];
+  const body = 'Tower facilities shall satisfy district setbacks. '.repeat(1500);
+  const fetcher = async (url: string) => {
+    seen.push(url);
+    if (url.includes('/Organizations/')) return { ClientID: 5211, State: { StateAbbreviation: 'VA' } };
+    if (url.includes('/ClientContent/')) return { codes: [{ productName: 'Code of Ordinances', productId: 13191 }] };
+    if (url.includes('/Jobs/latest/')) return { Id: 492787, ProductId: 13191 };
+    return { Docs: [{ Id: 'tower-node', Title: 'Tower standards', Content: `<p>${body}</p>` }] };
+  };
+  const text = await scrapeMunicodeSection('https://library.municode.com/va/accomack_county/codes/code_of_ordinances?nodeId=tower-node', fetcher);
+  assert.ok(text.includes(body.trim()));
+  assert.ok(text.length > 60000);
+  assert.ok(seen.at(-1)?.includes('jobId=492787&nodeId=tower-node&groupChunks=false'));
+});
+
+test('Municode adapter rejects content from a different state', async () => {
+  await assert.rejects(scrapeMunicodeSection('https://library.municode.com/va/accomack_county/codes/code_of_ordinances?nodeId=tower-node', async () => ({ ClientID: 5211, State: { StateAbbreviation: 'FL' } })), /identity mismatch/);
+});
 
 const request = {
   jurisdiction: "Brevard County",

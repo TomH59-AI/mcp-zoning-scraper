@@ -416,8 +416,40 @@ function isJsHeavyCodeSite(url: string): boolean {
   return /municode|amlegal|generalcode|ecode360|codelibrary/i.test(url);
 }
 
-function looksLikePlaceholder(text: string): boolean {
-  return text.length < 400 || /loading\s*(please\s*)?wait|enable javascript|access denied|just a moment/i.test(text.slice(0, 600));
+export function looksLikePlaceholder(text: string): boolean {
+  return text.length < 400 || /loading\s*(please\s*)?wait|enable javascript|access denied|just a moment|initializing application|requested content cannot be found|not authorized to view it/i.test(text.slice(0, 1200));
+}
+
+// Resolve the exact library section through Municode's public JSON service.
+// The browser shell can show a 200 error page for an otherwise valid section.
+export async function scrapeMunicodeSection(
+  url: string,
+  getJson: (url: string) => Promise<any> = async (target) => (await axios.get(target, { timeout: 30000 })).data,
+): Promise<string> {
+  const source = new URL(url);
+  const parts = source.pathname.split('/').filter(Boolean).map(decodeURIComponent);
+  const nodeId = source.searchParams.get('nodeId');
+  if (source.hostname !== 'library.municode.com' || parts[2] !== 'codes' || !nodeId || !parts[3]) {
+    throw new Error('Municode API requires an explicit library code section URL');
+  }
+  const client = await getJson(`https://library.municode.com/localapi/Organizations/GetByUrlEncodedNames/${encodeURIComponent(parts[0])}/${encodeURIComponent(parts[1])}`);
+  if (!client?.ClientID || String(client.State?.StateAbbreviation).toLowerCase() !== parts[0].toLowerCase()) {
+    throw new Error('Municode library client identity mismatch');
+  }
+  const content = await getJson(`https://api.municode.com/ClientContent/${client.ClientID}`);
+  const slug = (s: unknown) => String(s || '').trim().toLowerCase().replace(/\s+/g, '_');
+  const products = (content?.codes || []).filter((p: any) => !p.hideInLibrary && slug(p.productName) === parts[3].toLowerCase());
+  if (products.length !== 1) throw new Error('Municode code product is missing or ambiguous');
+  const productId = products[0].productId;
+  const job = await getJson(`https://api.municode.com/Jobs/latest/${productId}`);
+  if (!job?.Id || String(job.ProductId) !== String(productId)) throw new Error('Municode edition identity mismatch');
+  const query = new URLSearchParams({ productId: String(productId), jobId: String(job.Id), nodeId, groupChunks: 'false' });
+  const section = await getJson(`https://api.municode.com/CodesContent?${query}`);
+  const docs = Array.isArray(section?.Docs) ? section.Docs : [];
+  if (!docs.some((d: any) => d.Id === nodeId)) throw new Error('Municode response does not contain the requested section');
+  const text = docs.filter((d: any) => typeof d.Content === 'string').map((d: any) => `${d.Title || ''}\n${cleanHtml(d.Content)}`).join('\n\n');
+  if (looksLikePlaceholder(text)) throw new Error('Municode section contains no usable ordinance text');
+  return text;
 }
 
 export async function scrapeUrl(url: string): Promise<{ text: string; method: string }> {
@@ -426,6 +458,10 @@ export async function scrapeUrl(url: string): Promise<{ text: string; method: st
     : [["scrapfly", () => scrapeWithScrapfly(url)], ["direct", () => scrapeDirect(url)], ["playwright", () => scrapeWithPlaywright(url)], ["oxylabs_headless", () => scrapeWithOxyLabs(url)]];
 
   const errors: string[] = [];
+  if (new URL(url).hostname === 'library.municode.com' && new URL(url).searchParams.has('nodeId')) {
+    try { return { text: await scrapeMunicodeSection(url), method: 'municode_api' }; }
+    catch (error) { errors.push(`municode_api: ${error instanceof Error ? error.message : String(error)}`); }
+  }
   for (const [method, fn] of attempts) {
     try {
       const html = await fn();
@@ -820,4 +856,3 @@ export async function runScraper(opts: RunOptions = {}, onProgress?: (r: Jurisdi
 
   return summary;
 }
-
