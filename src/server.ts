@@ -160,7 +160,7 @@ function startJob(options: RunOptions, queue?: Job["queue"], claimedJobId?: stri
       : result.ingest.ok
         ? "verified"
         : `FAILED ${result.ingest.status} ${result.ingest.error ?? ""}`;
-    console.log(`[job ${job.id}] ${done}/${total} ${result.jurisdiction}, ${result.state} â†’ ingest ${outcome}`);
+    console.log(`[job ${job.id}] ${done}/${total} ${result.jurisdiction}, ${result.state} → ingest ${outcome}`);
   })
     .then((summary) => {
       job.summary = { ...summary, results: summary.results.slice(-25) };
@@ -561,7 +561,74 @@ function createServer(): McpServer {
       inputSchema: { limit: z.number().int().min(1).max(100).optional() }
     },
     async ({ limit }) => {
-   …821 tokens truncated…rape anything by itself â€” call runNextBatch to do the work. Use this once, then let a scheduled task call runNextBatch repeatedly.",
+      try {
+        const rows = await listEnrichmentQueue(limit ?? 25);
+        return text({ ok: true, rows: rows.length, queue: rows });
+      } catch (err) {
+        return fail(err);
+      }
+    }
+  );
+
+  server.registerTool(
+    "runEnrichmentQueue",
+    {
+      description:
+        "Process Pending or Failed Ordinances Inbox rows in guarded batches. Each jurisdiction must return verified Base44, Notion, and Supabase receipts before its row can advance. The batch freezes immediately on the first failed destination proof and retries Failed rows first.",
+      inputSchema: {
+        limit: z.number().int().min(1).max(25).optional().describe("Maximum jurisdictions to process (default 5)"),
+        replaceExisting: z.boolean().optional().describe("Refresh exact-match enriched pages (default true)")
+      }
+    },
+    async ({ limit, replaceExisting }) => {
+      try {
+        return text(await runEnrichmentQueue(limit ?? 5, replaceExisting !== false));
+      } catch (err) {
+        return fail(err);
+      }
+    }
+  );
+
+  server.registerTool(
+    "runScraper",
+    {
+      description:
+        "Scrape every Notion URL for the selected jurisdictions and push the page text to SiteHawk (Base44) zoningScraperIngest, which fills the SCIP template (Zoning Overview, Tower Specifics, Site Plan Overview, Building Permit Information) into Jurisdiction + TelecomOrdinance and records each URL in JurisdictionResource. Runs in the background by default — poll getScraperStatus with the returned job_id. Use dryRun to scrape without writing to Base44.",
+      inputSchema: {
+        ...selectionShape,
+        dryRun: z.boolean().optional().describe("Scrape only; do not send anything to Base44"),
+        skipExtraction: z.boolean().optional().describe("Record URLs in Base44 but skip the LLM extraction step"),
+        includePolygon: z.boolean().optional().describe("Look up the jurisdiction boundary on Nominatim (default true)"),
+        background: z.boolean().optional().describe("Return immediately with a job_id (default true). Set false for small batches (<=3) to wait for the result.")
+      }
+    },
+    async (args) => {
+      try {
+        if (args.dryRun !== true) {
+          return text({ ok: false, blocked: true, error: BROAD_SWEEP_BLOCK_REASON });
+        }
+        const { background, ...options } = args;
+        const wait = background === false;
+        if (!wait) {
+          if (activeJob) {
+            return text({ ok: false, error: `A job is already running (job_id ${activeJob.id}, ${activeJob.done}/${activeJob.total}). Poll getScraperStatus or wait for it to finish.` });
+          }
+          const job = startJob(options);
+          return text({ ok: true, started: true, ...jobView(job), hint: "Call getScraperStatus with this job_id to follow progress." });
+        }
+        const summary = await runScraper({ ...options, limit: Math.min(options.limit ?? 1, 3) });
+        return text({ ok: true, ...summary });
+      } catch (err) {
+        return fail(err);
+      }
+    }
+  );
+
+  server.registerTool(
+    "startZoningSweep",
+    {
+      description:
+        "Begin (or restart) a multi-state sweep of the Notion zoning library. Sets the durable cursor; does not scrape anything by itself — call runNextBatch to do the work. Use this once, then let a scheduled task call runNextBatch repeatedly.",
       inputSchema: {
         states: z.array(z.string()).min(1).describe("States in the order to sweep, e.g. ['FL','NC','GA']"),
         forceReset: z.literal(true).optional().describe("Required to abandon a latched failed sweep and create a new queue generation."),
@@ -662,7 +729,7 @@ function createServer(): McpServer {
           return text({
             ok: true,
             skipped: "job_in_flight",
-            message: `Batch ${activeJob.id} is still running (${activeJob.done}/${activeJob.total}) â€” nothing started.`,
+            message: `Batch ${activeJob.id} is still running (${activeJob.done}/${activeJob.total}) — nothing started.`,
             job_id: activeJob.id
           });
         }
@@ -682,7 +749,7 @@ function createServer(): McpServer {
           const requestedSize = batch ?? 3;
           const q = loadQueue();
           if (!q.states.length) {
-            return text({ ok: false, error: "No sweep configured â€” call startZoningSweep with the states first." });
+            return text({ ok: false, error: "No sweep configured — call startZoningSweep with the states first." });
           }
           if (!q.started_at) {
             return text({ ok: false, blocked: true, error: "The configured queue has no generation identifier; reset it before running." });
@@ -696,7 +763,7 @@ function createServer(): McpServer {
               skipped: stale ? "stale_job_in_flight" : "job_in_flight_other_process",
               message: stale
                 ? "A stale persisted batch claim was found. It will not be reused or bypassed; an operator must explicitly reset the sweep."
-                : "Another Railway process owns the current batch â€” nothing started.",
+                : "Another Railway process owns the current batch — nothing started.",
               in_flight: q.in_flight,
               stale,
             });
@@ -776,7 +843,7 @@ function createServer(): McpServer {
 
           if (plan.done) {
             const finished = finishQueueIfCurrent(originalCursor, advanced);
-            return text({ ok: true, done: true, queue: finished, message: "Sweep complete â€” every state has been scraped." });
+            return text({ ok: true, done: true, queue: finished, message: "Sweep complete — every state has been scraped." });
           }
 
           const jurisdictions = plan.jurisdictions ?? [];
@@ -955,7 +1022,7 @@ function startHttpServer(port: number, authToken: string): void {
     });
   });
 
-  // Same bearer token as /mcp â€” handy for watching a long run from a browser/curl.
+  // Same bearer token as /mcp — handy for watching a long run from a browser/curl.
   app.get("/jobs/:id", (request: Request, response: Response) => {
     if (!isAuthorized(request, authToken)) {
       response.status(401).json({ error: "Unauthorized" });
@@ -1040,4 +1107,3 @@ main().catch((error: unknown) => {
   console.error("MCP server failed to start:", error);
   process.exit(1);
 });
-
