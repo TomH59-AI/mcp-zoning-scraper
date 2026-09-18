@@ -195,7 +195,10 @@ function compactRecord(value: Record<string, unknown>): Record<string, unknown> 
 function finiteInteger(...values: unknown[]): number | null {
   for (const value of values) {
     if (value === null || value === undefined || value === "") continue;
-    const direct = typeof value === "number" ? value : Number.parseFloat(String(value).match(/-?\d+(?:\.\d+)?/)?.[0] || "");
+    // A section number or qualified narrative is not a scalar rule. Accept
+    // only a number, optionally followed by an explicit feet unit.
+    const scalar = String(value).trim().match(/^(-?\d+(?:\.\d+)?)(?:\s*(?:ft\.?|feet|foot))?$/i);
+    const direct = typeof value === "number" ? value : scalar ? Number(scalar[1]) : NaN;
     if (Number.isFinite(direct)) return Math.round(direct);
   }
   return null;
