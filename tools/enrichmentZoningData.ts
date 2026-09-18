@@ -220,6 +220,24 @@ function firstText(...values: unknown[]): string | null {
   return null;
 }
 
+// Delivery receipts prove storage, not whether a legal interpretation is sound.
+// Retain failed evidence in Base44's review queue; never export it as a rule.
+export function assertNoRejectedEvidence(...records: Array<Record<string, any> | null | undefined>): void {
+  const rejected = new Set<string>();
+  for (const record of records) {
+    for (const [field, raw] of Object.entries(asRecord(record?.field_citations) || {})) {
+      const citation = asRecord(raw);
+      if (!citation) continue;
+      if (citation.value_match === false
+        || /^(?:rejected|failed|conflict|invalid)(?:$|[\s:_-])/i.test(String(citation.qc_verdict || '').trim())
+        || /^(?:rejected|conflict|invalid)$/i.test(String(citation.review_status || '').trim())) {
+        rejected.add(field);
+      }
+    }
+  }
+  if (rejected.size) throw new Error(`Destination delivery requires review: rejected evidence for ${[...rejected].sort().join(', ')}. No Notion or Supabase write should proceed.`);
+}
+
 export function buildSupabaseTelecomRow(input: {
   jurisdiction: string;
   state: string;
@@ -233,6 +251,7 @@ export function buildSupabaseTelecomRow(input: {
   const jurisdiction = input.jurisdiction.replace(/\s+/g, " ").trim();
   const jurisdictionRecord = input.jurisdictionRecord || {};
   const telecom = input.telecomRecord || {};
+  assertNoRejectedEvidence(jurisdictionRecord, telecom);
   const tower = input.profile?.tower_specifics || {};
   const zoning = input.profile?.zoning_overview || {};
   const sourceUrls = input.profile?.source_urls || {};
@@ -526,27 +545,28 @@ function field(label: string, value: unknown) {
   };
 }
 
-function formatProfileBlocks(jurisdiction: string, state: string, profile: Record<string, any>, citations: Array<Record<string, any>>, stats: Record<string, any>) {
+export function formatProfileBlocks(jurisdiction: string, state: string, profile: Record<string, any>, citations: Array<Record<string, any>>, stats: Record<string, any>) {
   const z = profile.zoning_overview || {};
   const t = profile.tower_specifics || {};
   const sp = profile.site_plan_overview || {};
   const bp = profile.building_permit_information || {};
   const sourceUrls = profile.source_urls || {};
   const verified = String(profile.last_updated || new Date().toISOString()).slice(0, 10);
+  const approved = stats.verification_status === 'verified' && stats.review_required === false;
   const blocks: Array<Record<string, unknown>> = [
     {
       object: "block",
       type: "callout",
       callout: {
         icon: { type: "emoji", emoji: "📡" },
-        color: "green_background",
-        rich_text: [textRun(`KEY PROVISIONS (Parsed via SkyWave AI — ${verified}). Values are sourced from the listed documents; unavailable fields are marked for direct contact.`)],
+        color: approved ? "green_background" : "yellow_background",
+        rich_text: [textRun(`${approved ? 'APPROVED PROVISIONS' : 'REVIEW REQUIRED — UNAPPROVED EXTRACTION'} (Parsed via SkyWave AI — ${verified}). ${approved ? 'Review status is supplied by SiteHawk.' : 'Extraction confidence and successful delivery do not establish legal approval.'} Unavailable fields are marked for direct contact.`)],
       },
     },
     {
       object: "block",
       type: "paragraph",
-      paragraph: { rich_text: [textRun("Jurisdiction: ", true), textRun(`${jurisdiction}, ${state} | Verified: ${verified}`)] },
+      paragraph: { rich_text: [textRun("Jurisdiction: ", true), textRun(`${jurisdiction}, ${state} | Extracted: ${verified}`)] },
     },
     heading("1. Core Identification"),
     field("County name", profile.county),
@@ -808,6 +828,9 @@ export async function enrichZoningData(options: EnrichmentOptions) {
     const summary = (ingest.summary || {}) as Record<string, any>;
     const jurisdictionRecord = unwrapRecord(summary.jurisdiction_record);
     const telecomRecord = unwrapRecord(summary.telecom_ordinance);
+    // Check before either destination writes so a known bad claim cannot land
+    // in Notion while the Supabase branch rejects it afterward.
+    assertNoRejectedEvidence(jurisdictionRecord, telecomRecord);
     const registryRecord = unwrapRecord(summary.registry);
     const profile = asRecord(summary.county_profile)
       || asRecord(telecomRecord?.county_profile)
@@ -825,7 +848,11 @@ export async function enrichZoningData(options: EnrichmentOptions) {
     const citations = Array.isArray(summary.citations)
       ? summary.citations
       : citationsFromRecords(jurisdictionRecord, telecomRecord);
-    const stats = summary.extraction || {};
+    const stats = {
+      ...(summary.extraction || {}),
+      verification_status: telecomRecord?.verification_status || 'needs_review',
+      review_required: telecomRecord?.review_required !== false,
+    };
     const notion = options.writeToNotion === false
       ? null
       : await writeEnrichedPage(jurisdiction, state, profile, citations, stats, options.replaceExisting !== false);

@@ -5,7 +5,37 @@ import {
   canonicalNotionFooter,
   canonicalNotionTitle,
   verifySupabaseReceipt,
+  assertNoRejectedEvidence,
+  formatProfileBlocks,
 } from "./enrichmentZoningData.js";
+
+test('blocks the live Accomack rejected residential-to-setback mapping before export', () => {
+  const rejected = { setback_ft: 400, field_citations: { setback_ft: {
+    quote: 'The tower must be set back from any off-site residential structure no less than 400 feet.',
+    qc_verdict: 'rejected:semantic_mismatch', value_match: false,
+  } } };
+  assert.throws(() => assertNoRejectedEvidence(rejected), /requires review.*setback_ft/);
+  assert.throws(() => buildSupabaseTelecomRow({ jurisdiction: 'Accomack County', state: 'VA', telecomRecord: rejected }), /requires review.*setback_ft/);
+});
+
+test('a rejection in either Base44 projection prevents destination delivery', () => {
+  assert.throws(() => assertNoRejectedEvidence({ field_citations: { measured_from: { review_status: 'conflict' } } }, {}), /measured_from/);
+  assert.throws(() => assertNoRejectedEvidence({}, { field_citations: { height_limit_ft: { value_match: false } } }), /height_limit_ft/);
+  assert.doesNotThrow(() => assertNoRejectedEvidence({ field_citations: { residential_separation_ft: { qc_verdict: 'confirmed', value_match: true } } }));
+});
+
+test('high extraction confidence never labels a pending Notion page verified', () => {
+  const blocks = formatProfileBlocks('Accomack County', 'VA', { last_updated: '2026-09-18T15:04:00Z' }, [], { confidence: 'high', verification_status: 'needs_review', review_required: true });
+  const text = JSON.stringify(blocks);
+  assert.match(text, /REVIEW REQUIRED/);
+  assert.match(text, /Extracted: 2026-09-18/);
+  assert.doesNotMatch(text, /Verified:|APPROVED PROVISIONS/);
+});
+
+test('only an explicitly reviewed record gets an approved Notion heading', () => {
+  const blocks = formatProfileBlocks('Brevard County', 'FL', {}, [], { verification_status: 'verified', review_required: false });
+  assert.match(JSON.stringify(blocks), /APPROVED PROVISIONS/);
+});
 
 test("uses the exact Hacker Stackers title and footer standards", () => {
   assert.equal(canonicalNotionTitle("  Brevard   County ", "Florida"), "FL - Brevard County Telecom Ordinance");
