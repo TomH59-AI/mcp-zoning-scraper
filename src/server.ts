@@ -984,6 +984,44 @@ function startHttpServer(port: number, authToken: string): void {
     });
   });
 
+  // Temporary, read-only release diagnostic. It intentionally returns only
+  // the two Notion HTTP statuses and the integration name; credentials and
+  // provider error bodies never leave the Railway runtime.
+  app.get("/__diagnostics/notion-access-20260918", async (_request: Request, response: Response) => {
+    const notionKey = process.env.NOTION_KEY?.trim();
+    if (!notionKey) {
+      response.status(503).json({
+        users_me: { http_status: 503, integration_name: null },
+        destination_children: { http_status: 503 },
+      });
+      return;
+    }
+
+    const notionHeaders = {
+      Authorization: `Bearer ${notionKey}`,
+      "Notion-Version": "2025-09-03",
+    };
+    const [identityResponse, destinationResponse] = await Promise.all([
+      fetch("https://api.notion.com/v1/users/me", {
+        headers: notionHeaders,
+        signal: AbortSignal.timeout(15_000),
+      }),
+      fetch("https://api.notion.com/v1/blocks/fef2e8a4-6958-4bbc-bd9e-a564a26f76c9/children?page_size=1", {
+        headers: notionHeaders,
+        signal: AbortSignal.timeout(15_000),
+      }),
+    ]);
+    const identity = await identityResponse.json().catch(() => null) as Record<string, unknown> | null;
+
+    response.status(200).json({
+      users_me: {
+        http_status: identityResponse.status,
+        integration_name: typeof identity?.name === "string" ? identity.name : null,
+      },
+      destination_children: { http_status: destinationResponse.status },
+    });
+  });
+
   // Same bearer token as /mcp — handy for watching a long run from a browser/curl.
   app.get("/jobs/:id", (request: Request, response: Response) => {
     if (!isAuthorized(request, authToken)) {
