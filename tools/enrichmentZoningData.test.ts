@@ -37,6 +37,22 @@ test('only an explicitly reviewed record gets an approved Notion heading', () =>
   assert.match(JSON.stringify(blocks), /APPROVED PROVISIONS/);
 });
 
+test('unknown Accomack prose cannot turn section numbers or total users into scalar rules', () => {
+  const row = buildSupabaseTelecomRow({ jurisdiction: 'Accomack County', state: 'VA',
+    profile: { tower_specifics: {
+      maximum_tower_height: 'Not verified. Section 106-237 permits co-location extensions to 199 feet.',
+      required_collocations: 'Compatibility with at least 3 users INCLUDING the primary user; subject to waiver.',
+    } },
+  });
+  assert.equal(row.height_limit_ft, undefined);
+  assert.equal(row.collocation_required, undefined);
+});
+
+test('an explicit scalar feet value remains exportable', () => {
+  const row = buildSupabaseTelecomRow({ jurisdiction: 'Fixture County', state: 'VA', profile: { tower_specifics: { maximum_tower_height: '199 ft' } } });
+  assert.equal(row.height_limit_ft, 199);
+});
+
 test("uses the exact Hacker Stackers title and footer standards", () => {
   assert.equal(canonicalNotionTitle("  Brevard   County ", "Florida"), "FL - Brevard County Telecom Ordinance");
   assert.equal(canonicalNotionFooter("2026-08-26"), "Scraped and parsed by SkyWave AI — 2026-08-26");
