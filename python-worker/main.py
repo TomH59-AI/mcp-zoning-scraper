@@ -17,7 +17,7 @@ from urllib.parse import parse_qs, urljoin, urlsplit
 
 from fastapi import FastAPI, Header, HTTPException
 import httpx
-from playwright.async_api import Browser, async_playwright
+from playwright.async_api import Browser, TimeoutError as PlaywrightTimeoutError, async_playwright
 from pypdf import PdfReader
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -242,7 +242,7 @@ app = FastAPI(title="SiteHawk Ordinance Retrieval", lifespan=lifespan, docs_url=
 async def health() -> dict[str, str]:
     if browser is None or not browser.is_connected():
         raise HTTPException(503, "Browser is unavailable")
-    return {"status": "online", "service": "sitehawk-playwright-worker", "version": "1.3.2"}
+    return {"status": "online", "service": "sitehawk-playwright-worker", "version": "1.3.3"}
 
 
 @app.get("/sources")
@@ -298,7 +298,7 @@ async def retrieve(target_url: str) -> dict[str, Any]:
                 raise HTTPException(422, "Document redirect was blocked; use the official final URL")
             if response and response.status >= 400:
                 raise HTTPException(502, f"Source returned HTTP {response.status}")
-            selector = next((s for p, s in CONTAINERS.items() if host_matches(host, p)), "article, main, #content")
+            selector = next((s for p, s in CONTAINERS.items() if host_matches(host, p)), "article, main, #content, body")
             settings = {"selector": selector, "authorityPage": host.endswith('.gov')}
             # Wait for substantive legal text, never merely a sidebar or body.
             await page.wait_for_function(
@@ -356,7 +356,7 @@ async def scrape_municipality(req: ScrapeRequest, x_api_key: str | None = Header
         raise
     except ValueError:
         raise HTTPException(422, "Unsupported source URL") from None
-    except TimeoutError:
+    except (TimeoutError, PlaywrightTimeoutError):
         raise HTTPException(504, "Ordinance retrieval timed out") from None
     except Exception:
         raise HTTPException(502, "Source retrieval failed; no zoning values were changed") from None
