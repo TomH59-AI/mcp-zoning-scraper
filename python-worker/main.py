@@ -21,6 +21,8 @@ from playwright.async_api import Browser, TimeoutError as PlaywrightTimeoutError
 from pypdf import PdfReader
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+import municode
+
 PUBLISHERS = ("municode.com", "ecode360.com", "amlegal.com", "icccodesolutions.org", "elaws.us", "generalcode.com", "qcode.us", "codepublishing.com")
 GOV_DOCUMENT_PREFIXES = ('https://s3.us-east-2.amazonaws.com/assets.birminghamal.gov/',)
 US_STATES = set("AL AK AZ AR CA CO CT DE FL GA HI ID IL IN IA KS KY LA ME MD MA MI MN MS MO MT NE NV NH NJ NM NY NC ND OH OK OR PA RI SC SD TN TX UT VT VA WA WI WV WY DC".split())
@@ -242,7 +244,7 @@ app = FastAPI(title="SiteHawk Ordinance Retrieval", lifespan=lifespan, docs_url=
 async def health() -> dict[str, str]:
     if browser is None or not browser.is_connected():
         raise HTTPException(503, "Browser is unavailable")
-    return {"status": "online", "service": "sitehawk-playwright-worker", "version": "1.3.3"}
+    return {"status": "online", "service": "sitehawk-playwright-worker", "version": "1.4.0"}
 
 
 @app.get("/sources")
@@ -251,9 +253,31 @@ async def sources() -> dict[str, Any]:
             "libraries": SOURCE_LIBRARIES, "retrieval_requires": "an exact jurisdiction ordinance URL"}
 
 
+async def retrieve_municode(target_url: str) -> dict[str, Any] | None:
+    """Read the jurisdiction's actual tower sections through Municode's public API.
+
+    A stored Municode URL is often the code root or a district table, which the
+    browser path renders without any tower rules. None falls back to rendering.
+    """
+    try:
+        found = await asyncio.wait_for(municode.find_tower_sections(target_url), 30)
+    except (municode.MunicodeUnresolved, httpx.HTTPError, ValueError, KeyError, TimeoutError):
+        return None
+    validate_url(found["final_url"])
+    try:
+        payload = source_payload(found["text"], found["final_url"], found["page_title"], partial=found["truncated"])
+    except HTTPException:
+        return None  # too short to stand alone; let the rendered page try
+    return {**payload, "source_format": "municode_api", "sections": found["sections"], "discovered_source_urls": []}
+
+
 async def retrieve(target_url: str) -> dict[str, Any]:
     host = validate_url(target_url)
     await public_dns(host)
+    if host_matches(host, "municode.com"):
+        api_result = await retrieve_municode(target_url)
+        if api_result is not None:
+            return api_result
     if re.search(r"\.pdf(?:$|[?#])|/(?:DocumentCenter|AgendaCenter)/|/ViewFile/", target_url, re.I):
         async with slots:
             pdf = await retrieve_pdf(target_url, host)

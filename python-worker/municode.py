@@ -22,6 +22,7 @@ API = "https://library.municode.com/api"
 CLIENTS_API = "https://api.municode.com/Clients/stateAbbr"
 HEADERS = {"X-CSRF": "1", "Accept": "application/json", "User-Agent": "SiteHawk-ordinance-retrieval/1.4"}
 MAX_TEXT = 60_000
+MIN_TEXT = 600  # Base44 rejects retrieved text under 500 characters
 MAX_CANDIDATES = 8
 MAX_LEAVES = 40
 
@@ -158,7 +159,22 @@ def leaves(node: dict[str, Any]) -> list[str]:
 
 async def node_docs(client: httpx.AsyncClient, product_id: int, job_id: int, node: dict[str, Any]) -> list[tuple[str, str, str]]:
     docs: list[tuple[str, str, str]] = []
-    for node_id in leaves(node):
+    ids = leaves(node)
+    if len(ids) == 1:
+        # Many codes list a section's numbered subsections (7.11.22.01, .02 ...)
+        # as siblings rather than children. Read them from the chunk group.
+        data = await _get(client, f"{API}/CodesContent", jobId=job_id, nodeId=ids[0], productId=product_id, groupChunks="true")
+        group = (data or {}).get("Docs") or []
+        start = next((i for i, d in enumerate(group) if d.get("Id") == ids[0]), None)
+        if start is not None:
+            number = SECTION_NO.match(group[start].get("Title") or "")
+            for i, doc in enumerate(group[start:start + MAX_LEAVES]):
+                title = (doc.get("Title") or "").strip()
+                if i and not (number and SECTION_NO.match(title) and SECTION_NO.match(title).group(1).startswith(number.group(1) + ".")):
+                    break
+                docs.append((doc.get("Id"), title, html_text(doc.get("Content") or "")))
+            return docs
+    for node_id in ids:
         data = await _get(client, f"{API}/CodesContent", jobId=job_id, nodeId=node_id, productId=product_id, groupChunks="false")
         for doc in (data or {}).get("Docs") or []:
             if doc.get("Id") == node_id:
@@ -166,8 +182,53 @@ async def node_docs(client: httpx.AsyncClient, product_id: int, job_id: int, nod
     return docs
 
 
+TOWER_TERM = re.compile(r"\btowers?\b|monopoles?|antenna\s+support|wireless\s+(?:communication|telecommunication|facilit)"
+                        r"|telecommunications?\s+(?:towers?|facilit)|communications?\s+towers?", re.I)
+# Full-text queries for codes that put tower rules inside district or
+# supplemental sections whose headings never say "tower".
+SEARCH_TERMS = ("communication towers", "telecommunication towers", "wireless communication facilities",
+                "cell towers", "monopole", "towers")
+MAX_SEARCH_NODES = 8
+SECTION_NO = re.compile(r"\s*(?:Sec(?:tion)?\.?\s*|§\s*)?(\d+(?:[.\-]\d+)*[A-Za-z]?)\.?\s")
+
+
 def macro_score(text: str) -> int:
-    return len(MACRO.findall(text)) - 2 * len(SWA.findall(text))
+    """Siting signal. Small-wireless/tax mentions lower the rank but never hide a section."""
+    return len(MACRO.findall(text)) - len(SWA.findall(text))
+
+
+def keeps_tower_rules(text: str) -> bool:
+    return bool(TOWER_TERM.search(text)) and len(MACRO.findall(text)) >= 3
+
+
+def tower_windows(text: str, radius: int = 3) -> str:
+    """Lines that mention towers, with neighbours, for long sections found by search."""
+    lines = text.splitlines()
+    keep = sorted({i for n, line in enumerate(lines) if TOWER_TERM.search(line)
+                   for i in range(max(0, n - radius), min(len(lines), n + radius + 1))})
+    return "\n".join(lines[i] for i in keep)
+
+
+async def search_nodes(client: httpx.AsyncClient, client_id: int, products: dict[str, dict[str, Any]],
+                       seen: set[str]) -> list[dict[str, Any]]:
+    found: list[dict[str, Any]] = []
+    for term in SEARCH_TERMS:
+        if len(found) >= MAX_SEARCH_NODES:
+            break
+        data = await _get(client, f"{API}/search", clientId=client_id, contentTypeId="CODES", fragmentSize=200,
+                          isAdvanced="false", isAutocomplete="false", mode="ALL", pageNum=1, pageSize=10,
+                          searchText=term, sort=0, titlesOnly="false") or {}
+        for hit in data.get("Hits") or []:
+            node_id, title = hit.get("NodeId") or "", hit.get("Title") or ""
+            product = products.get(str((hit.get("Product") or {}).get("Id") or ""))
+            path = " / ".join(a.get("Title") or "" for a in hit.get("Ancestors") or [])
+            if not node_id or node_id in seen or not product or HEAD_NEG.search(title) or ANCESTOR_NEG.search(path):
+                continue
+            seen.add(node_id)
+            found.append({"node_id": node_id, "heading": title, "path": path, "product": product})
+            if len(found) >= MAX_SEARCH_NODES:
+                break
+    return found
 
 
 async def find_tower_sections(target_url: str, municipality: str = "") -> dict[str, Any]:
@@ -183,20 +244,41 @@ async def find_tower_sections(target_url: str, municipality: str = "") -> dict[s
         if not products:
             raise MunicodeUnresolved("client has no published code product")
         scored: list[dict[str, Any]] = []
+        jobs: dict[str, int] = {}
+        seen: set[str] = set()
         for product in products:
             job = await _get(client, f"{API}/Jobs/latest/{product['ProductID']}")
             if not job:
                 continue
+            jobs[str(product["ProductID"])] = job["Id"]
             toc = await product_toc(client, product["ProductID"], job["Id"])
             for cand in candidates(toc, url_node):
+                seen.update(leaves(cand["node"]))
                 docs = await node_docs(client, product["ProductID"], job["Id"], cand["node"])
                 body = "\n".join(f"{title}\n{text}" for _, title, text in docs if title or text)
                 if not body.strip():
                     continue
+                seen.update(doc_id for doc_id, _, _ in docs)
                 scored.append({"product": product, "node_id": cand["node"].get("Id"), "heading": cand["heading"],
-                               "path": cand["path"], "body": body,
-                               "rank": cand["score"] + min(macro_score(body), 40)})
-        scored = [s for s in scored if macro_score(s["body"]) >= 3]
+                               "path": cand["path"], "body": body, "strong": bool(HEAD_STRONG.search(cand["heading"])),
+                               "ids": {doc_id for doc_id, _, _ in docs},
+                               "titled": cand["score"] >= 8, "rank": cand["score"] + min(macro_score(body), 40)})
+        scored = [s for s in scored if (s["strong"] and TOWER_TERM.search(s["body"])) or keeps_tower_rules(s["body"])]
+        # No usable section is titled for towers, or it is too short to stand on
+        # its own: search the code's full text for the other tower rules.
+        if not any(s["titled"] for s in scored) or sum(len(s["body"]) for s in scored) < MIN_TEXT:
+            by_id = {str(p["ProductID"]): p for p in products if str(p["ProductID"]) in jobs}
+            for hit in await search_nodes(client, muni["ClientID"], by_id, seen):
+                pid = hit["product"]["ProductID"]
+                data = await _get(client, f"{API}/CodesContent", jobId=jobs[str(pid)], nodeId=hit["node_id"],
+                                  productId=pid, groupChunks="false") or {}
+                doc = next((d for d in data.get("Docs") or [] if d.get("Id") == hit["node_id"]), None)
+                if not doc:
+                    continue
+                text = html_text(doc.get("Content") or "")
+                body = f"{(doc.get('Title') or hit['heading']).strip()}\n{tower_windows(text) if len(text) > 12_000 else text}"
+                if keeps_tower_rules(body):
+                    scored.append({**hit, "body": body, "ids": {hit["node_id"]}, "rank": 3 + min(macro_score(body), 40)})
         if not scored:
             raise MunicodeUnresolved("no macro tower siting section found in any code product")
         scored.sort(key=lambda s: -s["rank"])
@@ -204,7 +286,10 @@ async def find_tower_sections(target_url: str, municipality: str = "") -> dict[s
         state_name = (muni.get("State") or {}).get("StateName") or state.upper()
         parts = [f"{muni['ClientName']}, {state_name} - Municode library"]
         used: list[dict[str, str]] = []
+        included: set[str] = set()
         for s in scored:
+            if s["ids"] <= included:
+                continue  # already inside a higher-ranked section's text
             block = f"\n\n[{s['product']['ProductName']} - {s['path']}]\n{s['body']}"
             if sum(len(p) for p in parts) + len(block) > MAX_TEXT:
                 if not used:
@@ -212,6 +297,7 @@ async def find_tower_sections(target_url: str, municipality: str = "") -> dict[s
                 else:
                     continue
             parts.append(block)
+            included |= s["ids"]
             used.append({"node_id": s["node_id"], "heading": s["heading"], "product": s["product"]["ProductName"]})
         product_slug = url_product if slug(best["product"]["ProductName"]) == slug(url_product) else slug(best["product"]["ProductName"])
         final_url = f"https://library.municode.com/{state}/{client_slug}/codes/{product_slug}?nodeId={best['node_id']}"
