@@ -383,7 +383,7 @@ export async function scrapeWithFirecrawl(url: string): Promise<string> {
     error?: string;
     data?: { html?: string; markdown?: string };
   }>(
-    "https://api.firecrawl.dev/v1/scrape",
+    "https://api.firecrawl.dev/v2/scrape",
     { url, formats: ["html"], onlyMainContent: false, waitFor: 2000, timeout: 60000 },
     {
       headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },

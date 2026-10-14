@@ -75,7 +75,7 @@ test("scrapeWithFirecrawl posts to the scrape endpoint and returns html", async 
     const html = await scrapeWithFirecrawl("https://example.gov/zoning");
     assert.equal(html, "<p>ok</p>");
     assert.equal(posts.length, 1);
-    assert.equal(posts[0][0], "https://api.firecrawl.dev/v1/scrape");
+    assert.equal(posts[0][0], "https://api.firecrawl.dev/v2/scrape");
     assert.equal((posts[0][2] as any).headers.Authorization, "Bearer test-key");
   });
 });
