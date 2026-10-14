@@ -1,0 +1,10 @@
+{
+  "entity": "ZoningWorkbookReference",
+  "add_properties": {
+    "railway_enrichment": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Bounded Railway retrieval lease and outcome on the same canonical zoning row. Not an alternate data source."
+    }
+  }
+}
