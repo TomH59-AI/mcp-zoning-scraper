@@ -45,7 +45,7 @@ CONTAINERS = {
 }
 TERMS = re.compile(r"\b(towers?|wireless|telecommunications?|antennas?|setbacks?)\b", re.I)
 MAX_TEXT = 60_000
-MAX_PDF_BYTES = 10_000_000
+MAX_PDF_BYTES = 20_000_000
 CACHE_TTL = 300
 browser: Browser | None = None
 slots = asyncio.Semaphore(2)
@@ -242,7 +242,7 @@ app = FastAPI(title="SiteHawk Ordinance Retrieval", lifespan=lifespan, docs_url=
 async def health() -> dict[str, str]:
     if browser is None or not browser.is_connected():
         raise HTTPException(503, "Browser is unavailable")
-    return {"status": "online", "service": "sitehawk-playwright-worker", "version": "1.3.1"}
+    return {"status": "online", "service": "sitehawk-playwright-worker", "version": "1.3.2"}
 
 
 @app.get("/sources")
@@ -271,6 +271,11 @@ async def retrieve(target_url: str) -> dict[str, Any]:
             request = route.request
             try:
                 is_document = request.resource_type == "document"
+                # Analytics and embedded-video frames are not a main-page
+                # redirect. Block those frames without invalidating the source.
+                if is_document and request.frame != page.main_frame:
+                    await route.abort()
+                    return
                 h = validate_url(request.url, assets=not is_document, document_host=host if is_document else "")
                 if h not in dns_checked:
                     await public_dns(h)
