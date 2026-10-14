@@ -10,6 +10,7 @@
 //   NOTION_ZONING_DB       database id, e.g. 356274bf71c180af8163d29dfbd263df
 //   BASE44_ZONING_INGEST   https://site-hawk-pro.base44.app/functions/zoningScraperIngest
 //   BASE44_WEBHOOK_SECRET  the app's WEBHOOK_SECRET  (falls back to BASE44_API_KEY)
+//   FIRECRAWL_API_KEY      optional; Firecrawl is tried first when set, otherwise the chain falls through
 //   SCRAPFLY_API_KEY / SCRAPFLY_KEY, OXYLABS_USERNAME, OXYLABS_PASSWORD / OXYLABS_KEY
 import axios from "axios";
 import { renderWithOxylabsHeadless, renderWithPlaywright } from "./browserRenderer.js";
@@ -372,6 +373,31 @@ async function scrapeWithOxyLabs(url: string): Promise<string> {
   return (await renderWithOxylabsHeadless(url)).html;
 }
 
+export async function scrapeWithFirecrawl(url: string): Promise<string> {
+  const key = optionalEnv("FIRECRAWL_API_KEY");
+  if (!key) throw new Error("Firecrawl key not configured");
+  // PDFs are handled by the existing PDF path (Scrapfly/pdf-parse), not Firecrawl.
+  if (/\.pdf(?:$|[?#])/i.test(url)) throw new Error("Firecrawl skipped for PDF");
+  const response = await axios.post<{
+    success?: boolean;
+    error?: string;
+    data?: { html?: string; markdown?: string };
+  }>(
+    "https://api.firecrawl.dev/v2/scrape",
+    { url, formats: ["html"], onlyMainContent: false, waitFor: 2000, timeout: 60000 },
+    {
+      headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+      timeout: 90000,
+    },
+  );
+  const body = response.data;
+  const content = body?.data?.html || body?.data?.markdown;
+  if (body?.success === false || !content) {
+    throw new Error(`Firecrawl returned no content${body?.error ? `: ${body.error}` : ""}`);
+  }
+  return content;
+}
+
 async function scrapeWithScrapfly(url: string): Promise<string> {
   const key = optionalEnv("SCRAPFLY_API_KEY", "SCRAPFLY_KEY");
   if (!key) throw new Error("Scrapfly key not configured");
@@ -454,8 +480,8 @@ export async function scrapeMunicodeSection(
 
 export async function scrapeUrl(url: string): Promise<{ text: string; method: string }> {
   const attempts: Array<[string, () => Promise<string>]> = isJsHeavyCodeSite(url)
-    ? [["scrapfly", () => scrapeWithScrapfly(url)], ["playwright", () => scrapeWithPlaywright(url)], ["oxylabs_headless", () => scrapeWithOxyLabs(url)]]
-    : [["scrapfly", () => scrapeWithScrapfly(url)], ["direct", () => scrapeDirect(url)], ["playwright", () => scrapeWithPlaywright(url)], ["oxylabs_headless", () => scrapeWithOxyLabs(url)]];
+    ? [["firecrawl", () => scrapeWithFirecrawl(url)], ["scrapfly", () => scrapeWithScrapfly(url)], ["playwright", () => scrapeWithPlaywright(url)], ["oxylabs_headless", () => scrapeWithOxyLabs(url)]]
+    : [["firecrawl", () => scrapeWithFirecrawl(url)], ["scrapfly", () => scrapeWithScrapfly(url)], ["direct", () => scrapeDirect(url)], ["playwright", () => scrapeWithPlaywright(url)], ["oxylabs_headless", () => scrapeWithOxyLabs(url)]];
 
   const errors: string[] = [];
   if (new URL(url).hostname === 'library.municode.com' && new URL(url).searchParams.has('nodeId')) {
