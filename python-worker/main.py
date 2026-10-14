@@ -16,15 +16,28 @@ from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Header, HTTPException
 from playwright.async_api import Browser, async_playwright
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-PUBLISHERS = ("municode.com", "ecode360.com", "amlegal.com", "icccodesolutions.org", "elaws.us")
+PUBLISHERS = ("municode.com", "ecode360.com", "amlegal.com", "icccodesolutions.org", "elaws.us", "generalcode.com", "qcode.us", "codepublishing.com")
+US_STATES = set("AL AK AZ AR CA CO CT DE FL GA HI ID IL IN IA KS KY LA ME MD MA MI MN MS MO MT NE NV NH NJ NM NY NC ND OH OK OR PA RI SC SD TN TX UT VT VA WA WI WV WY DC".split())
+SOURCE_LIBRARIES = [
+    {"name": "Municode", "url": "https://library.municode.com/", "role": "ordinance_directory"},
+    {"name": "ICC / General Code / eCode360", "url": "https://www.icccodesolutions.org/library/", "role": "ordinance_directory", "aliases": ["https://www.generalcode.com/library/"]},
+    {"name": "American Legal", "url": "https://codelibrary.amlegal.com/", "role": "ordinance_directory"},
+    {"name": "eLaws", "url": "https://www.elaws.us/", "role": "ordinance_directory"},
+    {"name": "QCode", "url": "https://qcode.us/", "role": "legacy_ordinance_host"},
+    {"name": "Code Publishing", "url": "https://www.codepublishing.com/", "role": "legacy_ordinance_host"},
+    {"name": "Zoneomics", "url": "https://www.zoneomics.com/", "role": "zoning_context_and_source_links"},
+]
 CONTAINERS = {
     "municode.com": ".chunk-content, #codesContent",
     "ecode360.com": "#code-content, .ecode-content, .law-content, #content, main",
     "amlegal.com": ".doc-body, .r-content, #main-content, main",
     "icccodesolutions.org": ".chapter-content, article, main",
     "elaws.us": ".law-content, #content, main",
+    "generalcode.com": "#code-content, article, main, #content",
+    "qcode.us": ".content, #content, #main-content, main, body",
+    "codepublishing.com": "#codeContent, #content, .content, main, body",
 }
 TERMS = re.compile(r"\b(tower|wireless|telecommunication|antenna|setback)\b", re.I)
 MAX_TEXT = 60_000
@@ -83,6 +96,13 @@ class ScrapeRequest(BaseModel):
     state: str = Field(pattern=r"^[A-Z]{2}$")
     target_url: str = Field(min_length=10, max_length=2048)
 
+    @field_validator("state")
+    @classmethod
+    def supported_state(cls, value: str) -> str:
+        if value not in US_STATES:
+            raise ValueError("Only U.S. states and DC are in this zoning workflow")
+        return value
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -109,7 +129,13 @@ app = FastAPI(title="SiteHawk Ordinance Retrieval", lifespan=lifespan, docs_url=
 async def health() -> dict[str, str]:
     if browser is None or not browser.is_connected():
         raise HTTPException(503, "Browser is unavailable")
-    return {"status": "online", "service": "sitehawk-playwright-worker", "version": "1.0.0"}
+    return {"status": "online", "service": "sitehawk-playwright-worker", "version": "1.1.0"}
+
+
+@app.get("/sources")
+async def sources() -> dict[str, Any]:
+    return {"source_of_truth": "Base44.ZoningWorkbookReference", "states": sorted(US_STATES),
+            "libraries": SOURCE_LIBRARIES, "retrieval_requires": "an exact jurisdiction ordinance URL"}
 
 
 async def retrieve(target_url: str) -> dict[str, Any]:
@@ -234,3 +260,4 @@ async def scrape_municipality(req: ScrapeRequest, x_api_key: str | None = Header
         raise HTTPException(504, "Ordinance retrieval timed out") from None
     except Exception:
         raise HTTPException(502, "Source retrieval failed; no zoning values were changed") from None
+
