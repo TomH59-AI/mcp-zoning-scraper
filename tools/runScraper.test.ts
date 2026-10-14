@@ -1,9 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import axios from "axios";
 import {
   selectGroups,
   looksLikePlaceholder,
   scrapeMunicodeSection,
+  scrapeWithFirecrawl,
   verifyBase44IngestResponse,
   type JurisdictionGroup,
 } from "./runScraper.js";
@@ -32,6 +34,50 @@ test('Municode adapter resolves exact client, edition and section and retains fu
 
 test('Municode adapter rejects content from a different state', async () => {
   await assert.rejects(scrapeMunicodeSection('https://library.municode.com/va/accomack_county/codes/code_of_ordinances?nodeId=tower-node', async () => ({ ClientID: 5211, State: { StateAbbreviation: 'FL' } })), /identity mismatch/);
+});
+
+async function withFirecrawlEnv<T>(key: string | undefined, fn: (posts: unknown[][]) => Promise<T>): Promise<T> {
+  const originalKey = process.env.FIRECRAWL_API_KEY;
+  const originalPost = axios.post;
+  const posts: unknown[][] = [];
+  if (key === undefined) delete process.env.FIRECRAWL_API_KEY;
+  else process.env.FIRECRAWL_API_KEY = key;
+  (axios as any).post = async (...args: unknown[]) => {
+    posts.push(args);
+    return { data: { success: true, data: { html: "<p>ok</p>" } } };
+  };
+  try {
+    return await fn(posts);
+  } finally {
+    (axios as any).post = originalPost;
+    if (originalKey === undefined) delete process.env.FIRECRAWL_API_KEY;
+    else process.env.FIRECRAWL_API_KEY = originalKey;
+  }
+}
+
+test("scrapeWithFirecrawl throws when the key is not configured", async () => {
+  await withFirecrawlEnv(undefined, async (posts) => {
+    await assert.rejects(scrapeWithFirecrawl("https://example.gov/zoning"), /Firecrawl key not configured/);
+    assert.equal(posts.length, 0);
+  });
+});
+
+test("scrapeWithFirecrawl skips PDF URLs without calling Firecrawl", async () => {
+  await withFirecrawlEnv("test-key", async (posts) => {
+    await assert.rejects(scrapeWithFirecrawl("https://example.gov/ordinance.pdf"), /Firecrawl skipped for PDF/);
+    await assert.rejects(scrapeWithFirecrawl("https://example.gov/ordinance.pdf?download=1"), /Firecrawl skipped for PDF/);
+    assert.equal(posts.length, 0);
+  });
+});
+
+test("scrapeWithFirecrawl posts to the scrape endpoint and returns html", async () => {
+  await withFirecrawlEnv("test-key", async (posts) => {
+    const html = await scrapeWithFirecrawl("https://example.gov/zoning");
+    assert.equal(html, "<p>ok</p>");
+    assert.equal(posts.length, 1);
+    assert.equal(posts[0][0], "https://api.firecrawl.dev/v1/scrape");
+    assert.equal((posts[0][2] as any).headers.Authorization, "Bearer test-key");
+  });
 });
 
 const request = {
