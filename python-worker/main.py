@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import io
 import ipaddress
 import os
 import re
@@ -12,10 +13,12 @@ import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
 from fastapi import FastAPI, Header, HTTPException
+import httpx
 from playwright.async_api import Browser, async_playwright
+from pypdf import PdfReader
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 PUBLISHERS = ("municode.com", "ecode360.com", "amlegal.com", "icccodesolutions.org", "elaws.us", "generalcode.com", "qcode.us", "codepublishing.com")
@@ -39,8 +42,9 @@ CONTAINERS = {
     "qcode.us": ".content, #content, #main-content, main, body",
     "codepublishing.com": "#codeContent, #content, .content, main, body",
 }
-TERMS = re.compile(r"\b(tower|wireless|telecommunication|antenna|setback)\b", re.I)
+TERMS = re.compile(r"\b(towers?|wireless|telecommunications?|antennas?|setbacks?)\b", re.I)
 MAX_TEXT = 60_000
+MAX_PDF_BYTES = 10_000_000
 CACHE_TTL = 300
 browser: Browser | None = None
 slots = asyncio.Semaphore(2)
@@ -54,9 +58,81 @@ CONTENT_TEXT_JS = r"""selector => {
         const copy = root.cloneNode(true);
         copy.querySelectorAll('nav,header,footer,aside,script,style,noscript,[role="navigation"],.code-footer,.breadcrumb,.codenav__section-breadcrumb').forEach(e => e.remove());
         return (copy.innerText || copy.textContent || '').trim();
-    }).filter(t => t.length >= 500 && /\b(tower|wireless|telecommunication|antenna|setback)\b/i.test(t));
+    }).filter(t => t.length >= 500 && /\b(towers?|wireless|telecommunications?|antennas?|setbacks?)\b/i.test(t));
     return candidates.sort((a,b) => b.length-a.length)[0] || '';
 }"""
+
+
+def source_payload(text: str, url: str, title: str, *, partial: bool = False) -> dict[str, Any]:
+    text = re.sub(r"[ \t]+", " ", text).strip()
+    if len(text) < 500 or not TERMS.search(text):
+        raise HTTPException(422, "No substantive telecommunications ordinance text was retrieved")
+    truncated = partial or len(text) > MAX_TEXT
+    if len(text) > MAX_TEXT:
+        lines = text.splitlines()
+        indices = {i for n, line in enumerate(lines) if TERMS.search(line)
+                   for i in range(max(0, n - 2), min(len(lines), n + 12))}
+        text = "\n".join(lines[i] for i in sorted(indices))[:MAX_TEXT]
+    if len(text) < 500:
+        raise HTTPException(422, "No substantive telecommunications ordinance text was retrieved")
+    return {"status": "success", "final_url": url, "page_title": title,
+            "raw_ordinance_text": text, "text_sha256": hashlib.sha256(text.encode()).hexdigest(),
+            "retrieved_at": datetime.now(timezone.utc).isoformat(),
+            "truncated": truncated, "scope": "retrieved_page_only", "complete_code": False}
+
+
+def pdf_text(data: bytes) -> tuple[str, str, bool, int, int]:
+    if not data.startswith(b"%PDF-") or len(data) > MAX_PDF_BYTES:
+        raise HTTPException(422, "Unsupported or oversized PDF source")
+    reader = PdfReader(io.BytesIO(data), strict=False)
+    if reader.is_encrypted:
+        raise HTTPException(422, "Encrypted ordinance PDF requires a readable public source")
+    page_count = len(reader.pages)
+    parts: list[str] = []
+    decoded_bytes = 0
+    deadline = time.monotonic() + 25
+    processed = 0
+    for page in reader.pages[:600]:
+        if time.monotonic() > deadline:
+            break
+        contents = page.get_contents()
+        page_bytes = len(contents.get_data()) if contents is not None else 0
+        decoded_bytes += page_bytes
+        if page_bytes > 4_000_000 or decoded_bytes > 30_000_000:
+            break
+        parts.append((page.extract_text(extraction_mode="layout") or "") if contents is not None else "")
+        processed += 1
+    text = "\n".join(parts).strip()
+    title = str(reader.metadata.title or "Official ordinance PDF") if reader.metadata else "Official ordinance PDF"
+    return text, title, processed < page_count, page_count, processed
+
+
+async def retrieve_pdf(target_url: str, host: str) -> dict[str, Any] | None:
+    # Explicit PDFs and government document-download endpoints cannot render
+    # as an HTML ordinance container. Retrieve their actual text instead.
+    current = target_url
+    async with httpx.AsyncClient(timeout=25, follow_redirects=False) as client:
+        for _ in range(5):
+            validate_url(current, document_host=host)
+            await public_dns(host)
+            async with client.stream("GET", current) as response:
+                if response.status_code in (301, 302, 303, 307, 308):
+                    current = urljoin(current, response.headers.get("location", ""))
+                    continue
+                if response.status_code >= 400:
+                    raise HTTPException(502, f"Source returned HTTP {response.status_code}")
+                mime = response.headers.get("content-type", "").lower()
+                if "pdf" not in mime and not urlsplit(current).path.lower().endswith(".pdf"):
+                    return None
+                data = bytearray()
+                async for chunk in response.aiter_bytes():
+                    data.extend(chunk)
+                    if len(data) > MAX_PDF_BYTES:
+                        raise HTTPException(422, "Ordinance PDF exceeds the bounded retrieval size")
+            text, title, partial, page_count, processed = await asyncio.to_thread(pdf_text, bytes(data))
+            return {**source_payload(text, current, title, partial=partial), "source_format": "pdf",
+                    "document_page_count": page_count, "processed_pages": processed}
+    raise HTTPException(422, "Too many document redirects")
 
 
 def host_matches(host: str, suffix: str) -> bool:
@@ -140,7 +216,7 @@ app = FastAPI(title="SiteHawk Ordinance Retrieval", lifespan=lifespan, docs_url=
 async def health() -> dict[str, str]:
     if browser is None or not browser.is_connected():
         raise HTTPException(503, "Browser is unavailable")
-    return {"status": "online", "service": "sitehawk-playwright-worker", "version": "1.1.1"}
+    return {"status": "online", "service": "sitehawk-playwright-worker", "version": "1.2.0"}
 
 
 @app.get("/sources")
@@ -152,6 +228,11 @@ async def sources() -> dict[str, Any]:
 async def retrieve(target_url: str) -> dict[str, Any]:
     host = validate_url(target_url)
     await public_dns(host)
+    if re.search(r"\.pdf(?:$|[?#])|/(?:DocumentCenter|AgendaCenter)/|/ViewFile/", target_url, re.I):
+        async with slots:
+            pdf = await retrieve_pdf(target_url, host)
+        if pdf is not None:
+            return pdf
     if browser is None:
         raise HTTPException(503, "Browser is unavailable")
     async with slots:
@@ -201,25 +282,9 @@ async def retrieve(target_url: str) -> dict[str, Any]:
                 }
             }""", selector)
             text = await page.evaluate(CONTENT_TEXT_JS, selector)
-            text = re.sub(r"[ \t]+", " ", text).strip()
-            if len(text) < 500 or not TERMS.search(text):
-                raise HTTPException(422, "No substantive telecommunications ordinance text was retrieved")
             final_url, title = page.url, await page.title()
             validate_url(final_url, document_host=host)
-            # Preserve the strongest relevant excerpts if a full book exceeds
-            # the cap; explicitly label the response as partial in that case.
-            truncated = len(text) > MAX_TEXT
-            if truncated:
-                lines = text.splitlines()
-                indices = {i for n, line in enumerate(lines) if TERMS.search(line)
-                           for i in range(max(0, n - 2), min(len(lines), n + 12))}
-                text = "\n".join(lines[i] for i in sorted(indices))[:MAX_TEXT]
-            return {
-                "status": "success", "final_url": final_url, "page_title": title,
-                "raw_ordinance_text": text, "text_sha256": hashlib.sha256(text.encode()).hexdigest(),
-                "retrieved_at": datetime.now(timezone.utc).isoformat(),
-                "truncated": truncated, "scope": "retrieved_page_only", "complete_code": False,
-            }
+            return source_payload(text, final_url, title)
         finally:
             await context.close()
 
