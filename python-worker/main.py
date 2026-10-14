@@ -32,7 +32,7 @@ SOURCE_LIBRARIES = [
 CONTAINERS = {
     "municode.com": ".chunk-content, #codesContent",
     "ecode360.com": "#code-content, .ecode-content, .law-content, #content, main",
-    "amlegal.com": ".doc-body, .r-content, #main-content, main",
+    "amlegal.com": "#codecontent, .doc-body, .r-content, #main-content, main",
     "icccodesolutions.org": ".chapter-content, article, main",
     "elaws.us": ".law-content, #content, main",
     "generalcode.com": "#code-content, article, main, #content",
@@ -46,6 +46,17 @@ browser: Browser | None = None
 slots = asyncio.Semaphore(2)
 cache: dict[str, tuple[float, dict[str, Any]]] = {}
 inflight: dict[str, asyncio.Task] = {}
+
+# Use the same cleaned legal-text extraction for readiness and final output.
+# American Legal's disclaimer/footer must never satisfy the hydration wait.
+CONTENT_TEXT_JS = r"""selector => {
+    const candidates = [...document.querySelectorAll(selector)].map(root => {
+        const copy = root.cloneNode(true);
+        copy.querySelectorAll('nav,header,footer,aside,script,style,noscript,[role="navigation"],.code-footer,.breadcrumb,.codenav__section-breadcrumb').forEach(e => e.remove());
+        return (copy.innerText || copy.textContent || '').trim();
+    }).filter(t => t.length >= 500 && /\b(tower|wireless|telecommunication|antenna|setback)\b/i.test(t));
+    return candidates.sort((a,b) => b.length-a.length)[0] || '';
+}"""
 
 
 def host_matches(host: str, suffix: str) -> bool:
@@ -129,7 +140,7 @@ app = FastAPI(title="SiteHawk Ordinance Retrieval", lifespan=lifespan, docs_url=
 async def health() -> dict[str, str]:
     if browser is None or not browser.is_connected():
         raise HTTPException(503, "Browser is unavailable")
-    return {"status": "online", "service": "sitehawk-playwright-worker", "version": "1.1.0"}
+    return {"status": "online", "service": "sitehawk-playwright-worker", "version": "1.1.1"}
 
 
 @app.get("/sources")
@@ -178,10 +189,8 @@ async def retrieve(target_url: str) -> dict[str, Any]:
             selector = next((s for p, s in CONTAINERS.items() if host_matches(host, p)), "article, main, #content")
             # Wait for substantive legal text, never merely a sidebar or body.
             await page.wait_for_function(
-                """({selector}) => [...document.querySelectorAll(selector)].some(e => {
-                    const t = e.innerText || '';
-                    return t.length >= 500 && /\\b(tower|wireless|telecommunication|antenna|setback)\\b/i.test(t);
-                })""", arg={"selector": selector}, timeout=20_000,
+                "selector => (" + CONTENT_TEXT_JS + ")(selector).length >= 500",
+                arg=selector, timeout=20_000,
             )
             await page.wait_for_timeout(1200)
             # Expand only explicit in-document disclosure buttons. Do not
@@ -191,15 +200,7 @@ async def retrieve(target_url: str) -> dict[str, Any]:
                     for (const d of root.querySelectorAll('details')) d.open = true;
                 }
             }""", selector)
-            text = await page.evaluate("""selector => {
-                const roots = [...document.querySelectorAll(selector)];
-                const candidates = roots.map(root => {
-                    const copy = root.cloneNode(true);
-                    copy.querySelectorAll('nav,header,footer,aside,script,style,noscript,[role="navigation"]').forEach(e => e.remove());
-                    return (copy.innerText || copy.textContent || '').trim();
-                }).filter(t => t.length >= 500 && /\\b(tower|wireless|telecommunication|antenna|setback)\\b/i.test(t));
-                return candidates.sort((a,b) => b.length-a.length)[0] || '';
-            }""", selector)
+            text = await page.evaluate(CONTENT_TEXT_JS, selector)
             text = re.sub(r"[ \t]+", " ", text).strip()
             if len(text) < 500 or not TERMS.search(text):
                 raise HTTPException(422, "No substantive telecommunications ordinance text was retrieved")
@@ -260,4 +261,3 @@ async def scrape_municipality(req: ScrapeRequest, x_api_key: str | None = Header
         raise HTTPException(504, "Ordinance retrieval timed out") from None
     except Exception:
         raise HTTPException(502, "Source retrieval failed; no zoning values were changed") from None
-
