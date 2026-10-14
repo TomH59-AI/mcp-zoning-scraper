@@ -53,19 +53,19 @@ inflight: dict[str, asyncio.Task] = {}
 
 # Use the same cleaned legal-text extraction for readiness and final output.
 # American Legal's disclaimer/footer must never satisfy the hydration wait.
-CONTENT_TEXT_JS = r"""selector => {
+CONTENT_TEXT_JS = r"""({selector, authorityPage}) => {
     const candidates = [...document.querySelectorAll(selector)].map(root => {
         const copy = root.cloneNode(true);
         copy.querySelectorAll('nav,header,footer,aside,script,style,noscript,[role="navigation"],.code-footer,.breadcrumb,.codenav__section-breadcrumb').forEach(e => e.remove());
         return (copy.innerText || copy.textContent || '').trim();
-    }).filter(t => t.length >= 500 && /\b(towers?|wireless|telecommunications?|antennas?|setbacks?)\b/i.test(t));
+    }).filter(t => t.length >= 500 && (/\b(towers?|wireless|telecommunications?|antennas?|setbacks?)\b/i.test(t) || (authorityPage && /zoning|planning|building permits?|land development|ordinances?/i.test(t))));
     return candidates.sort((a,b) => b.length-a.length)[0] || '';
 }"""
 
 
-def source_payload(text: str, url: str, title: str, *, partial: bool = False) -> dict[str, Any]:
+def source_payload(text: str, url: str, title: str, *, partial: bool = False, authority_page: bool = False) -> dict[str, Any]:
     text = re.sub(r"[ \t]+", " ", text).strip()
-    if len(text) < 500 or not TERMS.search(text):
+    if len(text) < 500 or not (TERMS.search(text) or authority_page and re.search(r'zoning|planning|building permits?|land development|ordinances?', text, re.I)):
         raise HTTPException(422, "No substantive telecommunications ordinance text was retrieved")
     truncated = partial or len(text) > MAX_TEXT
     if len(text) > MAX_TEXT:
@@ -79,6 +79,28 @@ def source_payload(text: str, url: str, title: str, *, partial: bool = False) ->
             "raw_ordinance_text": text, "text_sha256": hashlib.sha256(text.encode()).hexdigest(),
             "retrieved_at": datetime.now(timezone.utc).isoformat(),
             "truncated": truncated, "scope": "retrieved_page_only", "complete_code": False}
+
+
+def relevant_source_links(links: list[dict[str, str]], page_url: str) -> list[dict[str, str]]:
+    """Bounded research leads, not legal claims or a second source of truth."""
+    found: dict[str, dict[str, str]] = {}
+    page_host = urlsplit(page_url).hostname
+    for link in links:
+        target = urljoin(page_url, link.get('href', ''))
+        label = re.sub(r'\s+', ' ', link.get('text', '')).strip()[:200]
+        if not target or target == page_url or re.search(r'maps?|\bgis\b|arcgis|facebook|twitter|youtube', target + ' ' + label, re.I):
+            continue
+        if not re.search(r'tower|wireless|telecom|antenna|(?:zoning|development|municipal|land.use).{0,30}(?:code|ordinance|regulation)|(?:code|ordinance|regulation).{0,30}(?:zoning|development)|\.pdf(?:$|[?#])', target + ' ' + label, re.I):
+            continue
+        try:
+            host = validate_url(target)
+        except ValueError:
+            continue
+        if host != page_host and not any(host_matches(host, p) for p in PUBLISHERS):
+            continue
+        score = 0 if re.search(r'tower|wireless|telecom|antenna', target + ' ' + label, re.I) else 1
+        found.setdefault(target, {'url': target, 'label': label, 'parent_url': page_url, 'priority': score})
+    return sorted(found.values(), key=lambda x: (x['priority'], x['url']))[:12]
 
 
 def pdf_text(data: bytes) -> tuple[str, str, bool, int, int]:
@@ -216,7 +238,7 @@ app = FastAPI(title="SiteHawk Ordinance Retrieval", lifespan=lifespan, docs_url=
 async def health() -> dict[str, str]:
     if browser is None or not browser.is_connected():
         raise HTTPException(503, "Browser is unavailable")
-    return {"status": "online", "service": "sitehawk-playwright-worker", "version": "1.2.0"}
+    return {"status": "online", "service": "sitehawk-playwright-worker", "version": "1.3.0"}
 
 
 @app.get("/sources")
@@ -268,10 +290,11 @@ async def retrieve(target_url: str) -> dict[str, Any]:
             if response and response.status >= 400:
                 raise HTTPException(502, f"Source returned HTTP {response.status}")
             selector = next((s for p, s in CONTAINERS.items() if host_matches(host, p)), "article, main, #content")
+            settings = {"selector": selector, "authorityPage": host.endswith('.gov')}
             # Wait for substantive legal text, never merely a sidebar or body.
             await page.wait_for_function(
-                "selector => (" + CONTENT_TEXT_JS + ")(selector).length >= 500",
-                arg=selector, timeout=20_000,
+                "settings => (" + CONTENT_TEXT_JS + ")(settings).length >= 500",
+                arg=settings, timeout=20_000,
             )
             await page.wait_for_timeout(1200)
             # Expand only explicit in-document disclosure buttons. Do not
@@ -281,10 +304,12 @@ async def retrieve(target_url: str) -> dict[str, Any]:
                     for (const d of root.querySelectorAll('details')) d.open = true;
                 }
             }""", selector)
-            text = await page.evaluate(CONTENT_TEXT_JS, selector)
+            text = await page.evaluate(CONTENT_TEXT_JS, settings)
             final_url, title = page.url, await page.title()
             validate_url(final_url, document_host=host)
-            return source_payload(text, final_url, title)
+            links = await page.evaluate("""selector => [...document.querySelectorAll(selector)].flatMap(root => [...root.querySelectorAll('a[href]')].map(a => ({href: a.href, text: a.innerText || a.textContent || ''})))""", selector)
+            return {**source_payload(text, final_url, title, authority_page=settings['authorityPage']),
+                    'discovered_source_urls': relevant_source_links(links, final_url)}
         finally:
             await context.close()
 
@@ -326,3 +351,4 @@ async def scrape_municipality(req: ScrapeRequest, x_api_key: str | None = Header
         raise HTTPException(504, "Ordinance retrieval timed out") from None
     except Exception:
         raise HTTPException(502, "Source retrieval failed; no zoning values were changed") from None
+
