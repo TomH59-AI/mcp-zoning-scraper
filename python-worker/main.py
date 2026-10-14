@@ -13,7 +13,7 @@ import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import parse_qs, urljoin, urlsplit
 
 from fastapi import FastAPI, Header, HTTPException
 import httpx
@@ -22,6 +22,7 @@ from pypdf import PdfReader
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 PUBLISHERS = ("municode.com", "ecode360.com", "amlegal.com", "icccodesolutions.org", "elaws.us", "generalcode.com", "qcode.us", "codepublishing.com")
+GOV_DOCUMENT_PREFIXES = ('https://s3.us-east-2.amazonaws.com/assets.birminghamal.gov/',)
 US_STATES = set("AL AK AZ AR CA CO CT DE FL GA HI ID IL IN IA KS KY LA ME MD MA MI MN MS MO MT NE NV NH NJ NM NY NC ND OH OK OR PA RI SC SD TN TX UT VT VA WA WI WV WY DC".split())
 SOURCE_LIBRARIES = [
     {"name": "Municode", "url": "https://library.municode.com/", "role": "ordinance_directory"},
@@ -88,6 +89,9 @@ def relevant_source_links(links: list[dict[str, str]], page_url: str) -> list[di
     for link in links:
         target = urljoin(page_url, link.get('href', ''))
         label = re.sub(r'\s+', ' ', link.get('text', '')).strip()[:200]
+        embedded = parse_qs(urlsplit(target).query).get('document', [''])[0]
+        if any(embedded.startswith(prefix) for prefix in GOV_DOCUMENT_PREFIXES) and (page_host or '').removeprefix('www.') == 'birminghamal.gov':
+            target = embedded
         if not target or target == page_url or re.search(r'maps?|\bgis\b|arcgis|facebook|twitter|youtube', target + ' ' + label, re.I):
             continue
         if not re.search(r'tower|wireless|telecom|antenna|(?:zoning|development|municipal|land.use).{0,30}(?:code|ordinance|regulation)|(?:code|ordinance|regulation).{0,30}(?:zoning|development)|\.pdf(?:$|[?#])', target + ' ' + label, re.I):
@@ -96,7 +100,7 @@ def relevant_source_links(links: list[dict[str, str]], page_url: str) -> list[di
             host = validate_url(target)
         except ValueError:
             continue
-        if host != page_host and not any(host_matches(host, p) for p in PUBLISHERS):
+        if host != page_host and not any(host_matches(host, p) for p in PUBLISHERS) and not ((page_host or '').removeprefix('www.') == 'birminghamal.gov' and any(target.startswith(prefix) for prefix in GOV_DOCUMENT_PREFIXES)):
             continue
         score = 0 if re.search(r'tower|wireless|telecom|antenna', target + ' ' + label, re.I) else 1
         found.setdefault(target, {'url': target, 'label': label, 'parent_url': page_url, 'priority': score})
@@ -179,14 +183,14 @@ def validate_url(url: str, *, assets: bool = False, document_host: str = "") -> 
             raise
     if host == "localhost" or host.endswith((".local", ".internal", ".localhost")):
         raise ValueError("Private targets are not allowed")
-    official = host.endswith(".gov") or any(host_matches(host, p) for p in PUBLISHERS)
+    official = host.endswith(".gov") or any(host_matches(host, p) for p in PUBLISHERS) or any(url.startswith(prefix) for prefix in GOV_DOCUMENT_PREFIXES)
     extra = [s.strip().lower() for s in os.getenv("OFFICIAL_EXTRA_HOSTS", "").split(",") if s.strip()]
     official = official or any(host_matches(host, p) for p in extra)
     if not assets and not official:
         raise ValueError("Host must be an approved code publisher or government site")
     # Main-document redirects stay on the original host. Publishers' static
     # CDN assets may use other public HTTPS hosts, but never local addresses.
-    if document_host and host != document_host:
+    if document_host and host.removeprefix('www.') != document_host.removeprefix('www.'):
         raise ValueError("Cross-host document redirect requires a separately approved source URL")
     return host
 
@@ -238,7 +242,7 @@ app = FastAPI(title="SiteHawk Ordinance Retrieval", lifespan=lifespan, docs_url=
 async def health() -> dict[str, str]:
     if browser is None or not browser.is_connected():
         raise HTTPException(503, "Browser is unavailable")
-    return {"status": "online", "service": "sitehawk-playwright-worker", "version": "1.3.0"}
+    return {"status": "online", "service": "sitehawk-playwright-worker", "version": "1.3.1"}
 
 
 @app.get("/sources")
